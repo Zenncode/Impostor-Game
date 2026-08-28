@@ -6,16 +6,19 @@ import type { Difficulty } from "../constants/words";
 
 const PINK_ADJECTIVES = [
   "Sakura", "Rose", "Berry", "Blush", "Pink", "Mochi", "Peach", "Candy",
-  "Lotus", "Flamingo", "Velvet", "Ruby", "Petal", "Glitter", "Sparkle", "Sweet", "Cherry"
+  "Lotus", "Flamingo", "Velvet", "Ruby", "Petal", "Glitter", "Sparkle", "Sweet",
+  "Cherry", "Cotton", "Bubble", "Pastel", "Sunny", "Fluffy", "Kawaii", "Dainty",
+  "Chai", "Honey", "Luna", "Starry", "Cupcake", "Cosmic", "Silky", "Sugar"
 ];
 
 const PINK_NOUNS = [
   "Bunny", "Fox", "Kitty", "Queen", "Angel", "Fairy", "Panda", "Puppy",
-  "Princess", "Star", "Detective", "Sprite", "Butterfly", "Diva", "Ninja"
+  "Princess", "Star", "Detective", "Sprite", "Butterfly", "Diva", "Ninja",
+  "Bear", "Blossom", "Dolphin", "Otter", "Koala", "Pixie", "Charm", "Gem"
 ];
 
 const PINK_AVATARS = [
-  "🌸", "🎀", "💗", "🦩", "🌺", "💖", "✨", "🎭", "🌷", "👑", "🦄", "🍧", "🧁", "🍥"
+  "🌸", "🎀", "💗", "🦩", "🌺", "💖", "✨", "🎭", "🌷", "👑", "🦄", "🍧", "🧁", "🍥", "🐰", "🦊", "🐱", "🐼", "🍓", "🍰"
 ];
 
 export function generateUniquePinkProfile(): { name: string; avatar: string } {

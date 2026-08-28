@@ -67,16 +67,17 @@ export default function Home() {
     let savedName = localStorage.getItem("impostor_player_name");
     let savedAvatar = localStorage.getItem("impostor_player_avatar");
 
-    // If no name or generic old name, generate a unique cute pink profile!
-    if (!savedName || savedName === "Player_Pink" || savedName === "Guest_Pink") {
+    // Enforce unique cute pink name if empty or starts with Player or Guest
+    const isGeneric = !savedName || savedName.toLowerCase().startsWith("player") || savedName.toLowerCase().startsWith("guest");
+    if (isGeneric) {
       const generated = generateUniquePinkProfile();
       savedName = generated.name;
-      savedAvatar = savedAvatar || generated.avatar;
+      savedAvatar = generated.avatar;
       localStorage.setItem("impostor_player_name", savedName);
       localStorage.setItem("impostor_player_avatar", savedAvatar);
     }
 
-    setPlayerName(savedName);
+    setPlayerName(savedName || "PinkPlayer");
     setPlayerAvatar(savedAvatar || "🌸");
   }, []);
 
