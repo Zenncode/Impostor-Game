@@ -1,6 +1,5 @@
 "use client";
 import { useEffect, useState, useRef, useCallback } from "react";
-import Navbar from "./components/Navbar";
 import PetalBackground from "./components/PetalBackground";
 import SoundSettingsModal from "./components/SoundSettingsModal";
 import RulesModal from "./components/RulesModal";
@@ -13,7 +12,6 @@ import type { Difficulty, WordEntry } from "./constants/words";
 import {
   pickSecretWord,
   validateClue,
-  shuffleArray,
   formatTime,
   generatePlayers,
 } from "./lib/gameHelpers";
@@ -22,7 +20,7 @@ import type { Player, Clue } from "./types/game";
 
 const DIFF_ORDER: Difficulty[] = ["easy", "medium", "hard", "extremely_hard"];
 
-type GameMode = "impostor" | "crewmate" | "blitz";
+type GameMode = "classic" | "blitz";
 type GamePhase = "lobby" | "role_reveal" | "clue_feed" | "guess" | "reveal";
 
 export default function Home() {
@@ -37,7 +35,7 @@ export default function Home() {
   const [playerName, setPlayerName] = useState("Guest_Pink");
   const [playerAvatar, setPlayerAvatar] = useState("🌸");
   const [playerCount, setPlayerCount] = useState<number>(4); // Minimum 3 players
-  const [gameMode, setGameMode] = useState<GameMode>("impostor");
+  const [gameMode, setGameMode] = useState<GameMode>("classic");
   const [difficulty, setDifficulty] = useState<Difficulty>("medium");
   const [phase, setPhase] = useState<GamePhase>("lobby");
 
@@ -92,7 +90,7 @@ export default function Home() {
     localStorage.setItem("impostor_player_avatar", avatar);
   };
 
-  // Start a new game
+  // Start a new game with RANDOM Impostor or Crewmate role
   const startGame = useCallback(() => {
     sound.playClick();
     sound.playRoleReveal();
@@ -100,15 +98,14 @@ export default function Home() {
     const word = pickSecretWord(difficulty, prevWord || undefined);
     const count = Math.max(3, Math.min(10, playerCount));
     const generatedPlayers = generatePlayers(count, playerName);
-    generatedPlayers.find((p) => p.isHuman)!.avatar = playerAvatar;
-
-    let targetImpostorId = "human";
-    if (gameMode === "crewmate") {
-      // Pick one of the bots as impostor
-      const bots = generatedPlayers.filter((p) => !p.isHuman);
-      const randomBot = bots[Math.floor(Math.random() * bots.length)];
-      targetImpostorId = randomBot.id;
+    const humanPlayer = generatedPlayers.find((p) => p.isHuman);
+    if (humanPlayer) {
+      humanPlayer.avatar = playerAvatar;
     }
+
+    // Pick 1 random player from all players (Human or Bot) to be the Impostor
+    const randomImpostor = generatedPlayers[Math.floor(Math.random() * generatedPlayers.length)];
+    const targetImpostorId = randomImpostor.id;
 
     const updatedPlayers = generatedPlayers.map((p) => ({
       ...p,
@@ -145,12 +142,14 @@ export default function Home() {
   useEffect(() => {
     if (phase !== "clue_feed" || !secretWord) return;
 
+    const isHumanImpostor = impostorId === "human";
+
     // Check if clue limit reached
     if (clues.length >= cfg.clueLimit) {
-      if (gameMode === "impostor" || gameMode === "blitz") {
+      if (isHumanImpostor) {
         setPhase("guess");
       } else {
-        // AI Impostor makes a guess in crewmate mode
+        // AI Impostor makes a guess
         handleAiImpostorGuess();
       }
       return;
@@ -160,8 +159,8 @@ export default function Home() {
     const currentPlayer = players[currentClueIdx % players.length];
     if (!currentPlayer) return;
 
-    if (currentPlayer.isHuman && gameMode === "crewmate") {
-      // Human must submit a clue, wait for human input
+    if (currentPlayer.isHuman) {
+      // Human turn: wait for human to submit a clue
       return;
     }
 
@@ -189,7 +188,7 @@ export default function Home() {
       }
 
       const newClue: Clue = {
-        id: `clue-${Date.now()}-${clues.length}`,
+        id: "clue-" + Date.now() + "-" + clues.length,
         playerId: currentPlayer.id,
         playerName: currentPlayer.name,
         text: clueText,
@@ -218,9 +217,9 @@ export default function Home() {
     return () => {
       if (botClueTimeoutRef.current) clearTimeout(botClueTimeoutRef.current);
     };
-  }, [phase, clues.length, currentClueIdx, players, secretWord, impostorId, gameMode, cfg.clueLimit]);
+  }, [phase, clues.length, currentClueIdx, players, secretWord, impostorId, cfg.clueLimit]);
 
-  // AI Impostor final guess logic (when playing in Crewmate mode)
+  // AI Impostor final guess logic
   const handleAiImpostorGuess = useCallback(() => {
     if (!secretWord) return;
     setIsBotTyping(true);
@@ -251,8 +250,14 @@ export default function Home() {
       setTimeLeft((prev) => {
         if (prev <= 1) {
           if (phase === "clue_feed") {
-            setPhase("guess");
-            return 30;
+            const isHumanImpostor = impostorId === "human";
+            if (isHumanImpostor) {
+              setPhase("guess");
+              return 30;
+            } else {
+              handleAiImpostorGuess();
+              return 0;
+            }
           } else {
             // Time out: Impostor loses
             sound.playDefeat();
@@ -271,7 +276,7 @@ export default function Home() {
     return () => {
       if (timerRef.current) clearInterval(timerRef.current);
     };
-  }, [phase]);
+  }, [phase, impostorId, handleAiImpostorGuess]);
 
   // Finish match handler with stats & achievements record
   const finishMatch = (
@@ -285,7 +290,7 @@ export default function Home() {
     setIsGuessCorrect(correct);
     setPhase("reveal");
 
-    const userRole = gameMode === "impostor" ? "impostor" : "crewmate";
+    const userRole = impostorId === "human" ? "impostor" : "crewmate";
     const userWon =
       (userRole === "impostor" && roleWon === "impostor") ||
       (userRole === "crewmate" && roleWon === "crewmates");
@@ -298,7 +303,8 @@ export default function Home() {
       sound.playDefeat();
     }
 
-    const timeSpent = cfg.timeLimit - timeLeft;
+    const timeLimit = gameMode === "blitz" ? 45 : cfg.timeLimit;
+    const timeSpent = Math.max(0, timeLimit - timeLeft);
     const { updatedStats, newlyUnlockedBadges, pointsEarned } = recordGameResult(
       roleWon,
       userRole,
@@ -309,19 +315,36 @@ export default function Home() {
     setStats(updatedStats);
     setLastPointsEarned(pointsEarned);
     if (newlyUnlockedBadges.length > 0) {
-      setNewBadgesAlert(newlyUnlockedBadges.map((b) => `${b.icon} ${b.name}`));
+      setNewBadgesAlert(newlyUnlockedBadges.map((b) => b.icon + " " + b.name));
     }
   };
 
-  // Submit human clue (in Crewmate mode)
+  // Submit human clue (whether crewmate or impostor bluff)
   const handleHumanSubmitClue = () => {
-    if (!secretWord) return;
-    const res = validateClue(clueInput, secretWord.word);
-    if (!res.valid) {
-      setValidationError(res.reason || "Invalid clue");
+    const trimmed = clueInput.trim();
+    if (!trimmed) {
+      setValidationError("Please enter a clue!");
       return;
     }
-    if (clues.some((c) => c.text.toLowerCase() === clueInput.trim().toLowerCase())) {
+    if (trimmed.includes(" ")) {
+      setValidationError("Clue must be exactly ONE WORD");
+      return;
+    }
+    if (!/^[a-zA-Z\u00C0-\u024F\-]+$/.test(trimmed)) {
+      setValidationError("Only letters and hyphen allowed");
+      return;
+    }
+
+    const isHumanImpostor = impostorId === "human";
+    if (!isHumanImpostor && secretWord) {
+      const res = validateClue(trimmed, secretWord.word);
+      if (!res.valid) {
+        setValidationError(res.reason || "Invalid clue");
+        return;
+      }
+    }
+
+    if (clues.some((c) => c.text.toLowerCase() === trimmed.toLowerCase())) {
       setValidationError("Clue already given this match!");
       return;
     }
@@ -335,21 +358,25 @@ export default function Home() {
     };
 
     const newClue: Clue = {
-      id: `clue-human-${Date.now()}`,
+      id: "clue-human-" + Date.now(),
       playerId: humanPlayer.id,
       playerName: humanPlayer.name,
-      text: clueInput.trim(),
-      isImpostorClue: false,
+      text: trimmed,
+      isImpostorClue: isHumanImpostor,
       timestamp: Date.now(),
       valid: true,
     };
+
+    setPlayers((prev) =>
+      prev.map((p) => (p.isHuman ? { ...p, hasGivenClue: true } : p))
+    );
 
     setClues((prev) => [...prev, newClue]);
     setClueInput("");
     setCurrentClueIdx((prev) => prev + 1);
   };
 
-  // Submit human guess (in Impostor mode)
+  // Submit human guess (in Impostor role)
   const handleHumanGuess = () => {
     if (!secretWord) return;
     const guess = guessInput.trim();
@@ -375,12 +402,12 @@ export default function Home() {
 
     const hintList = [
       { type: "category", label: "Category", value: secretWord.category },
-      { type: "first_letter", label: "First Letter", value: `"${secretWord.word[0].toUpperCase()}"` },
-      { type: "length", label: "Word Length", value: `${secretWord.word.length} letters` },
+      { type: "first_letter", label: "First Letter", value: '"' + secretWord.word[0].toUpperCase() + '"' },
+      { type: "length", label: "Word Length", value: secretWord.word.length + " letters" },
       {
         type: "vowel_count",
         label: "Vowels",
-        value: `${(secretWord.word.match(/[aeiou]/gi) || []).length} vowels`,
+        value: ((secretWord.word.match(/[aeiou]/gi) || []).length) + " vowels",
       },
     ];
 
@@ -430,7 +457,8 @@ export default function Home() {
   // Timer rendering math
   const radius = 54;
   const circumference = 2 * Math.PI * radius;
-  const timerProgress = Math.max(0, Math.min(1, timeLeft / (gameMode === "blitz" ? 45 : cfg.timeLimit)));
+  const maxTimerDuration = gameMode === "blitz" ? 45 : cfg.timeLimit;
+  const timerProgress = Math.max(0, Math.min(1, timeLeft / maxTimerDuration));
   const offset = circumference * (1 - timerProgress);
   const isWarn = timeLeft <= 10;
 
@@ -439,7 +467,54 @@ export default function Home() {
   // -------------------------------------------------------------
 
   const renderLobby = () => (
-    <div className="w-full max-w-xl mx-auto py-8 sm:py-12 space-y-7 animate-fadeIn">
+    <div className="w-full max-w-xl mx-auto py-6 sm:py-10 space-y-6 animate-fadeIn">
+      {/* Top Lobby Bar: Streak, Points & Modals Access */}
+      <div className="flex items-center justify-between gap-3 p-3.5 rounded-3xl bg-pink-950/40 border border-pink-500/25 shadow-lg">
+        <div className="flex items-center gap-2 px-3 py-1.5 rounded-2xl bg-pink-900/50 border border-pink-500/30 text-xs font-black shadow-inner">
+          <span className="text-amber-400">🔥 {stats?.currentStreak || 0}</span>
+          <span className="text-pink-500/40">|</span>
+          <span className="text-pink-300">🌸 {stats?.pinkPoints || 0}</span>
+        </div>
+
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => {
+              sound.playClick();
+              setIsRulesOpen(true);
+            }}
+            title="How to play"
+            className="px-3 py-1.5 rounded-2xl bg-pink-950/50 hover:bg-pink-900/40 border border-pink-500/25 text-pink-200 text-xs font-bold flex items-center gap-1.5 cursor-pointer transition active:scale-95 shadow-sm"
+          >
+            <span>📖</span>
+            <span className="hidden sm:inline">Rules</span>
+          </button>
+
+          <button
+            onClick={() => {
+              sound.playClick();
+              setIsStatsOpen(true);
+            }}
+            title="View Stats & Badges"
+            className="px-3 py-1.5 rounded-2xl bg-pink-950/50 hover:bg-pink-900/40 border border-pink-500/25 text-pink-200 text-xs font-bold flex items-center gap-1.5 cursor-pointer transition active:scale-95 shadow-sm"
+          >
+            <span>🏆</span>
+            <span className="hidden sm:inline">Stats</span>
+          </button>
+
+          <button
+            onClick={() => {
+              sound.playClick();
+              setIsSoundOpen(true);
+            }}
+            title="Sound & Music Settings"
+            className="px-3 py-1.5 rounded-2xl bg-pink-950/50 hover:bg-pink-900/40 border border-pink-500/25 text-pink-200 text-xs font-bold flex items-center gap-1.5 cursor-pointer transition active:scale-95 shadow-sm"
+          >
+            <span>🔊</span>
+            <span className="hidden sm:inline">Audio</span>
+          </button>
+        </div>
+      </div>
+
       {/* Title & Badge */}
       <div className="text-center space-y-2.5">
         <div className="inline-flex items-center gap-2 px-4 py-1 rounded-full bg-pink-500/15 border border-pink-500/30 text-pink-300 text-xs font-black tracking-widest uppercase shadow-sm">
@@ -477,11 +552,11 @@ export default function Home() {
                 sound.playClick();
                 handleUpdateProfile(playerName, emoji);
               }}
-              className={`w-8 h-8 rounded-xl flex items-center justify-center text-sm transition cursor-pointer ${
+              className={"w-8 h-8 rounded-xl flex items-center justify-center text-sm transition cursor-pointer " + (
                 playerAvatar === emoji
                   ? "bg-pink-500 text-white ring-2 ring-pink-300 scale-110"
                   : "bg-pink-950/40 hover:bg-pink-900/30 border border-pink-500/20"
-              }`}
+              )}
             >
               {emoji}
             </button>
@@ -491,43 +566,37 @@ export default function Home() {
 
       {/* Game Mode Selector */}
       <div className="space-y-2">
-        <label className="text-xs font-black tracking-widest text-pink-300 uppercase block px-1">
-          SELECT GAME MODE
-        </label>
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+        <div className="flex justify-between items-center px-1">
+          <label className="text-xs font-black tracking-widest text-pink-300 uppercase">
+            GAME MODE
+          </label>
+          <span className="text-[11px] font-bold text-pink-400">
+            🎲 Random Role Assignment
+          </span>
+        </div>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
           <button
             onClick={() => {
               sound.playClick();
-              setGameMode("impostor");
+              setGameMode("classic");
             }}
-            className={`p-4 rounded-2xl text-left border cursor-pointer transition relative ${
-              gameMode === "impostor"
+            className={"p-4 rounded-2xl text-left border cursor-pointer transition relative " + (
+              gameMode === "classic"
                 ? "bg-gradient-to-br from-pink-600/30 to-pink-950 border-pink-400 shadow-lg shadow-pink-500/20 ring-2 ring-pink-500"
                 : "bg-pink-950/20 border-pink-500/20 hover:bg-pink-900/20"
-            }`}
+            )}
           >
-            <div className="text-2xl mb-1">🎭</div>
-            <div className="font-black text-sm text-white">Play Impostor</div>
-            <div className="text-[11px] text-pink-300/70 mt-0.5">
-              Deduce the word from bot clues & hint tokens
+            <div className="flex items-center justify-between mb-1">
+              <span className="text-2xl">🌸</span>
+              {gameMode === "classic" && (
+                <span className="text-[10px] font-black px-2 py-0.5 rounded-full bg-pink-500 text-white">
+                  SELECTED
+                </span>
+              )}
             </div>
-          </button>
-
-          <button
-            onClick={() => {
-              sound.playClick();
-              setGameMode("crewmate");
-            }}
-            className={`p-4 rounded-2xl text-left border cursor-pointer transition relative ${
-              gameMode === "crewmate"
-                ? "bg-gradient-to-br from-pink-600/30 to-pink-950 border-pink-400 shadow-lg shadow-pink-500/20 ring-2 ring-pink-500"
-                : "bg-pink-950/20 border-pink-500/20 hover:bg-pink-900/20"
-            }`}
-          >
-            <div className="text-2xl mb-1">🛡️</div>
-            <div className="font-black text-sm text-white">Play Crewmate</div>
+            <div className="font-black text-sm text-white">Classic Mode</div>
             <div className="text-[11px] text-pink-300/70 mt-0.5">
-              Give subtle clues & call Emergency Meetings
+              Standard round timers · Full clues & hint tokens
             </div>
           </button>
 
@@ -536,16 +605,23 @@ export default function Home() {
               sound.playClick();
               setGameMode("blitz");
             }}
-            className={`p-4 rounded-2xl text-left border cursor-pointer transition relative ${
+            className={"p-4 rounded-2xl text-left border cursor-pointer transition relative " + (
               gameMode === "blitz"
                 ? "bg-gradient-to-br from-pink-600/30 to-pink-950 border-pink-400 shadow-lg shadow-pink-500/20 ring-2 ring-pink-500"
                 : "bg-pink-950/20 border-pink-500/20 hover:bg-pink-900/20"
-            }`}
+            )}
           >
-            <div className="text-2xl mb-1">⚡</div>
+            <div className="flex items-center justify-between mb-1">
+              <span className="text-2xl">⚡</span>
+              {gameMode === "blitz" && (
+                <span className="text-[10px] font-black px-2 py-0.5 rounded-full bg-pink-500 text-white">
+                  SELECTED
+                </span>
+              )}
+            </div>
             <div className="font-black text-sm text-white">Speed Blitz</div>
             <div className="text-[11px] text-pink-300/70 mt-0.5">
-              Rapid 45s clock for max score multiplier
+              Rapid 45s clock · High intensity & 1.5x score bonus
             </div>
           </button>
         </div>
@@ -558,7 +634,7 @@ export default function Home() {
             PLAYERS IN ROOM (MINIMUM 3)
           </label>
           <span className="text-[11px] font-bold text-pink-400">
-            1 Impostor + {playerCount - 1} Crewmates
+            1 Impostor + {playerCount - 1} Crewmates (Randomized)
           </span>
         </div>
         <div className="grid grid-cols-6 gap-2">
@@ -571,11 +647,11 @@ export default function Home() {
                   sound.playClick();
                   setPlayerCount(num);
                 }}
-                className={`py-3 rounded-2xl font-black text-xs border cursor-pointer transition relative flex flex-col items-center justify-center ${
+                className={"py-3 rounded-2xl font-black text-xs border cursor-pointer transition relative flex flex-col items-center justify-center " + (
                   active
                     ? "bg-gradient-to-br from-pink-500 to-pink-600 border-pink-300 text-white shadow-lg shadow-pink-500/30 ring-2 ring-pink-400 scale-105"
                     : "bg-pink-950/30 border-pink-500/20 text-pink-200 hover:bg-pink-900/25"
-                }`}
+                )}
               >
                 <span className="text-sm">{num}</span>
                 <span className="text-[9px] opacity-75 font-semibold">players</span>
@@ -601,11 +677,11 @@ export default function Home() {
                   sound.playClick();
                   setDifficulty(d);
                 }}
-                className={`p-3.5 rounded-2xl text-left border cursor-pointer transition relative ${
+                className={"p-3.5 rounded-2xl text-left border cursor-pointer transition relative " + (
                   active
                     ? "bg-gradient-to-br from-pink-500 to-pink-600 border-pink-300 text-white shadow-lg shadow-pink-500/30 ring-2 ring-pink-400"
                     : "bg-pink-950/30 border-pink-500/20 text-pink-200 hover:bg-pink-900/25"
-                }`}
+                )}
               >
                 {active && (
                   <span className="absolute top-2.5 right-2.5 text-xs bg-white text-pink-600 rounded-full w-4 h-4 flex items-center justify-center font-bold">
@@ -644,15 +720,15 @@ export default function Home() {
         </div>
         <div className="space-y-2">
           <div className="text-xs font-black tracking-widest text-pink-300 uppercase">
-            YOUR ASSIGNED ROLE
+            YOUR ASSIGNED ROLE (RANDOM)
           </div>
           <h2 className="text-4xl font-black text-white tracking-tight">
             {isHumanImpostor ? "YOU ARE THE IMPOSTOR" : "YOU ARE A CREWMATE"}
           </h2>
           <p className="text-sm text-pink-200/80">
             {isHumanImpostor
-              ? "You do NOT know the secret word! Deduce it from the crewmates' clues."
-              : `The secret word is "${secretWord?.word.toUpperCase()}" in [${secretWord?.category}]. Give subtle clues!`}
+              ? "You do NOT know the secret word! Deduce it from the crewmates' clues and bluff your way to victory."
+              : "The secret word is \"" + (secretWord?.word.toUpperCase() || "") + "\" in [" + (secretWord?.category || "") + "]. Give subtle clues!"}
           </p>
         </div>
       </div>
@@ -672,9 +748,9 @@ export default function Home() {
           stroke="currentColor"
         />
         <circle
-          className={`text-pink-500 transition-all duration-1000 ${
+          className={"text-pink-500 transition-all duration-1000 " + (
             isWarn ? "timer-ring-warn" : ""
-          }`}
+          )}
           cx="60"
           cy="60"
           r={radius}
@@ -688,9 +764,9 @@ export default function Home() {
       </svg>
       <div className="absolute inset-0 flex flex-col items-center justify-center">
         <div
-          className={`text-3xl sm:text-4xl font-black tracking-tight ${
+          className={"text-3xl sm:text-4xl font-black tracking-tight " + (
             isWarn ? "text-rose-400 heartbeat" : "text-white"
-          }`}
+          )}
         >
           {formatTime(timeLeft)}
         </div>
@@ -703,8 +779,26 @@ export default function Home() {
 
   const renderClueFeed = () => {
     const isHumanImpostor = impostorId === "human";
+    const currentPlayer = players[currentClueIdx % players.length];
+    const isHumanTurn = currentPlayer?.isHuman;
+
     return (
       <div className="max-w-xl mx-auto w-full space-y-5 animate-fadeIn">
+        {/* In-Game Top Control Bar */}
+        <div className="flex items-center justify-between px-1">
+          <div className="text-xs font-black text-pink-300 uppercase tracking-wider flex items-center gap-2">
+            <span>Round {round}</span>
+            <span className="text-pink-500/40">·</span>
+            <span>{playerCount} Players</span>
+          </div>
+          <button
+            onClick={handleNewGame}
+            className="px-3 py-1 rounded-xl bg-pink-950/40 hover:bg-pink-900/30 border border-pink-500/25 text-pink-300 text-xs font-bold cursor-pointer transition active:scale-95"
+          >
+            🏠 Leave to Lobby
+          </button>
+        </div>
+
         {/* Role & Secret Word Card */}
         <div className="p-4 rounded-3xl bg-pink-950/40 border border-pink-500/20 shadow-lg flex items-center justify-between gap-3">
           <div className="flex items-center gap-3">
@@ -739,7 +833,7 @@ export default function Home() {
                 {hideSecretWord ? "👁️ Show" : "🙈 Hide"}
               </button>
             )}
-            {gameMode === "crewmate" && (
+            {!isHumanImpostor && (
               <button
                 onClick={() => {
                   if (emergencyMeetingsLeft > 0) {
@@ -748,11 +842,11 @@ export default function Home() {
                   }
                 }}
                 disabled={emergencyMeetingsLeft <= 0}
-                className={`px-3 py-1.5 rounded-xl text-xs font-black flex items-center gap-1.5 cursor-pointer shadow-md transition ${
+                className={"px-3 py-1.5 rounded-xl text-xs font-black flex items-center gap-1.5 cursor-pointer shadow-md transition " + (
                   emergencyMeetingsLeft > 0
                     ? "bg-gradient-to-r from-rose-500 to-pink-600 text-white shadow-rose-500/30 active:scale-95 animate-pulse"
                     : "bg-zinc-800 text-zinc-500 cursor-not-allowed"
-                }`}
+                )}
               >
                 <span>🚨</span> Meeting ({emergencyMeetingsLeft})
               </button>
@@ -763,7 +857,7 @@ export default function Home() {
         {/* Timer */}
         {renderTimerRing()}
 
-        {/* Unlocked Hints Bar (in Impostor mode) */}
+        {/* Unlocked Hints Bar (in Impostor role) */}
         {isHumanImpostor && (
           <div className="space-y-2">
             <div className="flex items-center justify-between px-1">
@@ -832,9 +926,17 @@ export default function Home() {
           )}
         </div>
 
-        {/* Input Bar for Human Clue (when playing as Crewmate) */}
-        {gameMode === "crewmate" && (
-          <div className="space-y-2 pt-2">
+        {/* Input Bar for Human Clue (when it's human's turn) */}
+        {isHumanTurn && (
+          <div className="space-y-2 pt-2 animate-fadeIn">
+            <div className="text-[11px] font-black text-pink-300 flex items-center gap-1.5 px-1">
+              <span>👉</span>
+              <span>
+                {isHumanImpostor
+                  ? "Your turn! Give a bluff clue to blend in:"
+                  : "Your turn! Give a one-word clue about the secret word:"}
+              </span>
+            </div>
             <div className="flex gap-2">
               <input
                 value={clueInput}
@@ -845,7 +947,12 @@ export default function Home() {
                 onKeyDown={(e) => {
                   if (e.key === "Enter") handleHumanSubmitClue();
                 }}
-                placeholder="Type your one-word clue here..."
+                autoFocus
+                placeholder={
+                  isHumanImpostor
+                    ? "Type a bluff clue..."
+                    : "Type a clue for \"" + (secretWord?.word.toUpperCase() || "") + "\"..."
+                }
                 className="flex-1 px-4 py-3 rounded-2xl bg-black/40 border border-pink-500/30 text-sm text-white placeholder-pink-300/40 outline-none focus:border-pink-400 focus:ring-1 focus:ring-pink-400"
               />
               <button
@@ -883,6 +990,19 @@ export default function Home() {
 
   const renderGuessPhase = () => (
     <div className="max-w-md mx-auto w-full text-center space-y-6 animate-fadeIn py-6">
+      {/* In-Game Top Control Bar */}
+      <div className="flex items-center justify-between px-1">
+        <div className="text-xs font-black text-pink-300 uppercase tracking-wider">
+          Round {round} · Final Deduction
+        </div>
+        <button
+          onClick={handleNewGame}
+          className="px-3 py-1 rounded-xl bg-pink-950/40 hover:bg-pink-900/30 border border-pink-500/25 text-pink-300 text-xs font-bold cursor-pointer transition active:scale-95"
+        >
+          🏠 Leave
+        </button>
+      </div>
+
       {renderTimerRing()}
 
       <div className="space-y-1">
@@ -1006,16 +1126,6 @@ export default function Home() {
     <div className="min-h-screen w-full flex flex-col relative bg-[#1A0A0F] text-[#FFE4E1] overflow-x-hidden">
       <PetalBackground />
 
-      {/* Navigation Header */}
-      <Navbar
-        streak={stats?.currentStreak || 0}
-        points={stats?.pinkPoints || 0}
-        onOpenStats={() => setIsStatsOpen(true)}
-        onOpenRules={() => setIsRulesOpen(true)}
-        onOpenSound={() => setIsSoundOpen(true)}
-        onHomeClick={handleNewGame}
-      />
-
       {/* Main Game Screen */}
       <main className="w-full max-w-4xl mx-auto px-4 py-6 flex-1 flex flex-col justify-center relative z-10">
         {phase === "lobby" && renderLobby()}
@@ -1029,10 +1139,10 @@ export default function Home() {
       {showConfetti && (
         <div className="fixed inset-0 pointer-events-none z-50 overflow-hidden">
           {Array.from({ length: 60 }).map((_, i) => {
-            const tx = `${(Math.random() - 0.5) * 500}px`;
-            const ty = `${250 + Math.random() * 350}px`;
-            const tr = `${(Math.random() - 0.5) * 720}deg`;
-            const dur = `${0.9 + Math.random() * 0.7}s`;
+            const tx = (Math.random() - 0.5) * 500 + "px";
+            const ty = 250 + Math.random() * 350 + "px";
+            const tr = (Math.random() - 0.5) * 720 + "deg";
+            const dur = 0.9 + Math.random() * 0.7 + "s";
             const colors = ["#FF69B4", "#FF1493", "#FFB6C1", "#FFE4E1", "#FFFFFF", "#FF6EB4"];
             return (
               <div
@@ -1040,10 +1150,10 @@ export default function Home() {
                 className="confetti-burst absolute"
                 style={
                   {
-                    left: `${50 + (Math.random() - 0.5) * 80}%`,
-                    top: `${30 + Math.random() * 30}%`,
-                    width: `${8 + Math.random() * 8}px`,
-                    height: `${8 + Math.random() * 8}px`,
+                    left: (50 + (Math.random() - 0.5) * 80) + "%",
+                    top: (30 + Math.random() * 30) + "%",
+                    width: (8 + Math.random() * 8) + "px",
+                    height: (8 + Math.random() * 8) + "px",
                     background: colors[Math.floor(Math.random() * colors.length)],
                     borderRadius: Math.random() > 0.5 ? "50%" : "2px",
                     opacity: 1,
