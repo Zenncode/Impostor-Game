@@ -52,8 +52,24 @@ export type GameRoom = {
   updatedAt: number;
 };
 
-const LOBBY_DISCOVERY_TOPIC = "impostor-game/v1/lobbies";
-const ROOM_TOPIC_PREFIX = "impostor-game/v1/rooms/";
+const LOBBY_DISCOVERY_TOPIC = "impostor-game/v2/lobbies";
+const ROOM_TOPIC_PREFIX = "impostor-game/v2/rooms/";
+
+// Multi-broker fallback URLs for 100% uptime
+const BROKER_URLS = [
+  "wss://broker.emqx.io:8084/mqtt",
+  "wss://broker.hivemq.com:8884/mqtt",
+  "wss://test.mosquitto.org:8081",
+];
+
+export function normalizeRoomCode(raw: string): string {
+  const cleaned = raw.trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
+  const digits = cleaned.replace(/[^0-9]/g, "");
+  if (digits.length >= 3) {
+    return "PINK-" + digits;
+  }
+  return cleaned.startsWith("PINK") ? cleaned : "PINK-" + cleaned;
+}
 
 class MultiplayerSyncManager {
   private client: MqttClient | null = null;
@@ -62,91 +78,133 @@ class MultiplayerSyncManager {
   private activeRoomsListeners: Set<(rooms: GameRoom[]) => void> = new Set();
   private roomListeners: Map<string, Set<(room: GameRoom | null) => void>> = new Map();
   private heartbeatInterval: NodeJS.Timeout | null = null;
-  private subscribedRoomTopics: Set<string> = new Set();
+  private joinRetryInterval: NodeJS.Timeout | null = null;
+  private messageQueue: { topic: string; data: any }[] = [];
+  private broadcastChannel: BroadcastChannel | null = null;
 
   constructor() {
     if (typeof window !== "undefined") {
-      this.initMqtt();
+      try {
+        this.broadcastChannel = new BroadcastChannel("impostor_local_channel_v2");
+        this.broadcastChannel.onmessage = (e) => {
+          this.handleIncomingData(e.data.topic, e.data.payload);
+        };
+      } catch {
+        // no broadcast channel
+      }
 
-      // Clean stale active lobbies every 4s
+      this.connectBroker(0);
+
+      // Periodically clean stale rooms (older than 8s without heartbeat)
       setInterval(() => {
         const now = Date.now();
         let changed = false;
         this.activeRoomsMap.forEach((room, id) => {
-          if (now - room.updatedAt > 10000) {
+          if (now - room.updatedAt > 8000) {
             this.activeRoomsMap.delete(id);
             changed = true;
           }
         });
         if (changed) this.notifyActiveRooms();
-      }, 4000);
+      }, 3000);
     }
   }
 
-  private initMqtt() {
+  private connectBroker(index: number) {
+    if (index >= BROKER_URLS.length) index = 0;
+    const url = BROKER_URLS[index];
+
     try {
-      const clientId = "client_" + Math.random().toString(16).substring(2, 10);
-      this.client = mqtt.connect("wss://broker.emqx.io:8084/mqtt", {
+      const clientId = "pink_" + Math.random().toString(36).substring(2, 11);
+      this.client = mqtt.connect(url, {
         clientId,
         keepalive: 30,
-        reconnectPeriod: 2000,
+        reconnectPeriod: 3000,
+        connectTimeout: 5000,
         clean: true,
       });
 
       this.client.on("connect", () => {
-        // Subscribe to public lobbies channel for discovering active rooms
         this.client?.subscribe(LOBBY_DISCOVERY_TOPIC);
-
-        // Re-subscribe to current room topic if active
         if (this.currentRoom) {
-          const roomTopic = ROOM_TOPIC_PREFIX + this.currentRoom.id.toUpperCase();
-          this.client?.subscribe(roomTopic);
+          this.client?.subscribe(ROOM_TOPIC_PREFIX + this.currentRoom.id.toUpperCase());
         }
+
+        // Flush queued messages
+        while (this.messageQueue.length > 0) {
+          const item = this.messageQueue.shift();
+          if (item) this.publish(item.topic, item.data);
+        }
+
+        // Request all active rooms on network
+        this.publish(LOBBY_DISCOVERY_TOPIC, { type: "DISCOVER_ROOMS_PING" });
       });
 
       this.client.on("message", (topic, message) => {
         try {
           const payload = JSON.parse(message.toString());
-          if (topic === LOBBY_DISCOVERY_TOPIC) {
-            this.handleLobbyDiscoveryMessage(payload);
-          } else if (topic.startsWith(ROOM_TOPIC_PREFIX)) {
-            const roomId = topic.replace(ROOM_TOPIC_PREFIX, "");
-            this.handleRoomMessage(roomId, payload);
-          }
+          this.handleIncomingData(topic, payload);
         } catch {
-          // ignore parsing errors
+          // ignore parsing error
         }
       });
 
-      this.client.on("error", (err) => {
-        console.warn("MQTT connection notice:", err.message);
+      this.client.on("error", () => {
+        // Try fallback broker on error
+        setTimeout(() => {
+          if (!this.client?.connected) {
+            this.client?.end(true);
+            this.connectBroker(index + 1);
+          }
+        }, 3000);
       });
-    } catch (e) {
-      console.warn("Failed to initialize online multiplayer sync:", e);
+    } catch {
+      // ignore
     }
   }
 
-  private handleLobbyDiscoveryMessage(data: { type: string; room?: GameRoom; roomId?: string }) {
-    if (data.type === "LOBBY_HEARTBEAT" && data.room) {
-      this.activeRoomsMap.set(data.room.id, data.room);
-      this.notifyActiveRooms();
-    } else if (data.type === "LOBBY_CLOSED" && data.roomId) {
-      this.activeRoomsMap.delete(data.roomId);
-      this.notifyActiveRooms();
+  private handleIncomingData(topic: string, payload: any) {
+    if (topic === LOBBY_DISCOVERY_TOPIC) {
+      if (payload.type === "LOBBY_HEARTBEAT" && payload.room) {
+        this.activeRoomsMap.set(payload.room.id, payload.room);
+        this.notifyActiveRooms();
+      } else if (payload.type === "LOBBY_CLOSED" && payload.roomId) {
+        this.activeRoomsMap.delete(payload.roomId);
+        this.notifyActiveRooms();
+      } else if (payload.type === "DISCOVER_ROOMS_PING") {
+        // If we are currently hosting a waiting room, immediately broadcast heartbeat
+        if (this.currentRoom && this.isCurrentPlayerHost()) {
+          this.publish(LOBBY_DISCOVERY_TOPIC, {
+            type: "LOBBY_HEARTBEAT",
+            room: this.currentRoom,
+          });
+        }
+      }
+    } else if (topic.startsWith(ROOM_TOPIC_PREFIX)) {
+      const roomId = topic.replace(ROOM_TOPIC_PREFIX, "");
+      this.handleRoomMessage(roomId, payload);
     }
   }
 
   private handleRoomMessage(roomId: string, data: any) {
-    const isHost = this.currentRoom?.hostId && this.currentRoom.players.find((p) => p.isHost)?.id === this.currentRoom.hostId;
+    const isHost = this.isCurrentPlayerHost();
 
     if (data.type === "ROOM_STATE" && data.room) {
       this.currentRoom = data.room;
       this.notifyRoomListeners(roomId, data.room);
       this.activeRoomsMap.set(data.room.id, data.room);
       this.notifyActiveRooms();
+
+      // Stop join retry interval if we received valid room state with us inside
+      if (this.joinRetryInterval) {
+        const myId = this.getCurrentPlayerId();
+        if (data.room.players.some((p: RoomPlayer) => p.id === myId)) {
+          clearInterval(this.joinRetryInterval);
+          this.joinRetryInterval = null;
+        }
+      }
     } else if (data.type === "PLAYER_JOIN_REQUEST" && data.player) {
-      // If we are the host of this room, handle the join request
-      if (this.currentRoom && this.currentRoom.id === roomId && this.currentRoom.players[0]?.id === this.getCurrentPlayerId()) {
+      if (this.currentRoom && this.currentRoom.id === roomId && isHost) {
         const room = this.currentRoom;
         if (room.status === "waiting" && room.players.length < room.maxPlayers) {
           const existingIdx = room.players.findIndex((p) => p.id === data.player.id);
@@ -169,7 +227,7 @@ class MultiplayerSyncManager {
         }
       }
     } else if (data.type === "PLAYER_LEAVE_REQUEST" && data.playerId) {
-      if (this.currentRoom && this.currentRoom.id === roomId && this.currentRoom.players[0]?.id === this.getCurrentPlayerId()) {
+      if (this.currentRoom && this.currentRoom.id === roomId && isHost) {
         const room = this.currentRoom;
         room.players = room.players.filter((p) => p.id !== data.playerId);
         if (room.players.length === 0) {
@@ -180,18 +238,24 @@ class MultiplayerSyncManager {
         }
       }
     } else if (data.type === "SUBMIT_CLUE_REQUEST" && data.clueText && data.playerId) {
-      if (this.currentRoom && this.currentRoom.id === roomId && this.currentRoom.players[0]?.id === this.getCurrentPlayerId()) {
+      if (this.currentRoom && this.currentRoom.id === roomId && isHost) {
         this.processClueSubmission(this.currentRoom, data.clueText, data.playerId);
       }
     } else if (data.type === "CAST_VOTE_REQUEST" && data.voterId && data.targetId) {
-      if (this.currentRoom && this.currentRoom.id === roomId && this.currentRoom.players[0]?.id === this.getCurrentPlayerId()) {
+      if (this.currentRoom && this.currentRoom.id === roomId && isHost) {
         this.processVote(this.currentRoom, data.voterId, data.targetId);
       }
     } else if (data.type === "SUBMIT_GUESS_REQUEST" && data.guessText) {
-      if (this.currentRoom && this.currentRoom.id === roomId && this.currentRoom.players[0]?.id === this.getCurrentPlayerId()) {
+      if (this.currentRoom && this.currentRoom.id === roomId && isHost) {
         this.processFinalGuess(this.currentRoom, data.guessText);
       }
     }
+  }
+
+  private isCurrentPlayerHost(): boolean {
+    if (!this.currentRoom) return false;
+    const myId = this.getCurrentPlayerId();
+    return this.currentRoom.hostId === myId || this.currentRoom.players[0]?.id === myId;
   }
 
   private getCurrentPlayerId(): string {
@@ -209,8 +273,18 @@ class MultiplayerSyncManager {
   }
 
   private publish(topic: string, data: any) {
+    if (this.broadcastChannel) {
+      try {
+        this.broadcastChannel.postMessage({ topic, payload: data });
+      } catch {
+        // ignore
+      }
+    }
+
     if (this.client && this.client.connected) {
       this.client.publish(topic, JSON.stringify(data));
+    } else {
+      this.messageQueue.push({ topic, data });
     }
   }
 
@@ -228,7 +302,7 @@ class MultiplayerSyncManager {
     this.activeRoomsListeners.forEach((cb) => cb(rooms));
   }
 
-  // --- HOST PROCESSING ACTIONS ---
+  // --- HOST PROCESSING ---
 
   private processClueSubmission(room: GameRoom, clueText: string, playerId: string) {
     const player = room.players.find((p) => p.id === playerId);
@@ -249,7 +323,6 @@ class MultiplayerSyncManager {
     const nextTurnIndex = room.turnIndex + 1;
     room.turnIndex = nextTurnIndex;
 
-    // Check if all players have submitted a clue
     if (room.clues.length >= room.players.length) {
       room.matchPhase = "voting";
       room.votes = {};
@@ -301,7 +374,6 @@ class MultiplayerSyncManager {
       room.updatedAt = Date.now();
       this.broadcastRoomState(room);
 
-      // Transition to Guess Phase after 4.5 seconds
       setTimeout(() => {
         if (this.currentRoom && this.currentRoom.id === room.id && this.currentRoom.matchPhase === "ejection_reveal") {
           this.currentRoom.matchPhase = "guess";
@@ -330,7 +402,7 @@ class MultiplayerSyncManager {
     this.broadcastRoomState(room);
   }
 
-  // --- PUBLIC INTERFACE ---
+  // --- PUBLIC METHODS ---
 
   public createRoom(
     hostPlayer: { id: string; name: string; avatar: string },
@@ -384,7 +456,7 @@ class MultiplayerSyncManager {
     const roomTopic = ROOM_TOPIC_PREFIX + newRoom.id.toUpperCase();
     this.client?.subscribe(roomTopic);
 
-    // Start lobby heartbeat to announce room across the internet
+    // Heartbeat every 1.5s
     if (this.heartbeatInterval) clearInterval(this.heartbeatInterval);
     this.heartbeatInterval = setInterval(() => {
       if (this.currentRoom && this.currentRoom.id === newRoom.id) {
@@ -394,9 +466,8 @@ class MultiplayerSyncManager {
           room: this.currentRoom,
         });
       }
-    }, 2500);
+    }, 1500);
 
-    // Initial broadcast
     this.publish(LOBBY_DISCOVERY_TOPIC, { type: "LOBBY_HEARTBEAT", room: newRoom });
     this.broadcastRoomState(newRoom);
 
@@ -407,20 +478,27 @@ class MultiplayerSyncManager {
     roomId: string,
     player: { id: string; name: string; avatar: string }
   ): { success: boolean; error?: string; room?: GameRoom } {
-    const formattedId = roomId.trim().toUpperCase();
+    const formattedId = normalizeRoomCode(roomId);
     const roomTopic = ROOM_TOPIC_PREFIX + formattedId;
 
     this.client?.subscribe(roomTopic);
 
-    // Send join request to room host
-    this.publish(roomTopic, {
-      type: "PLAYER_JOIN_REQUEST",
-      player: {
-        id: player.id,
-        name: player.name,
-        avatar: player.avatar,
-      },
-    });
+    const sendJoin = () => {
+      this.publish(roomTopic, {
+        type: "PLAYER_JOIN_REQUEST",
+        player: {
+          id: player.id,
+          name: player.name,
+          avatar: player.avatar,
+        },
+      });
+    };
+
+    sendJoin();
+
+    // Retry sending join request every 800ms until state is synced
+    if (this.joinRetryInterval) clearInterval(this.joinRetryInterval);
+    this.joinRetryInterval = setInterval(sendJoin, 800);
 
     const knownRoom = this.activeRoomsMap.get(formattedId);
     if (knownRoom) {
@@ -428,10 +506,9 @@ class MultiplayerSyncManager {
       return { success: true, room: knownRoom };
     }
 
-    // Temporary room placeholder while waiting for Host response
     const tempRoom: GameRoom = {
       id: formattedId,
-      name: "Joining Room...",
+      name: "Connecting to Lobby...",
       hostId: "",
       hostName: "Host",
       status: "waiting",
@@ -469,7 +546,7 @@ class MultiplayerSyncManager {
   }
 
   public leaveRoom(roomId: string, playerId: string) {
-    const formattedId = roomId.trim().toUpperCase();
+    const formattedId = normalizeRoomCode(roomId);
     const roomTopic = ROOM_TOPIC_PREFIX + formattedId;
 
     this.publish(roomTopic, {
@@ -480,6 +557,10 @@ class MultiplayerSyncManager {
     if (this.heartbeatInterval) {
       clearInterval(this.heartbeatInterval);
       this.heartbeatInterval = null;
+    }
+    if (this.joinRetryInterval) {
+      clearInterval(this.joinRetryInterval);
+      this.joinRetryInterval = null;
     }
 
     this.publish(LOBBY_DISCOVERY_TOPIC, { type: "LOBBY_CLOSED", roomId: formattedId });
@@ -528,7 +609,7 @@ class MultiplayerSyncManager {
   }
 
   public submitClue(roomId: string, clueText: string, playerId: string) {
-    const formattedId = roomId.trim().toUpperCase();
+    const formattedId = normalizeRoomCode(roomId);
     const roomTopic = ROOM_TOPIC_PREFIX + formattedId;
     this.publish(roomTopic, {
       type: "SUBMIT_CLUE_REQUEST",
@@ -538,7 +619,7 @@ class MultiplayerSyncManager {
   }
 
   public castVote(roomId: string, voterId: string, targetId: string) {
-    const formattedId = roomId.trim().toUpperCase();
+    const formattedId = normalizeRoomCode(roomId);
     const roomTopic = ROOM_TOPIC_PREFIX + formattedId;
     this.publish(roomTopic, {
       type: "CAST_VOTE_REQUEST",
@@ -548,7 +629,7 @@ class MultiplayerSyncManager {
   }
 
   public submitFinalGuess(roomId: string, guessText: string) {
-    const formattedId = roomId.trim().toUpperCase();
+    const formattedId = normalizeRoomCode(roomId);
     const roomTopic = ROOM_TOPIC_PREFIX + formattedId;
     this.publish(roomTopic, {
       type: "SUBMIT_GUESS_REQUEST",
@@ -589,6 +670,10 @@ class MultiplayerSyncManager {
   public subscribeToActiveRooms(callback: (rooms: GameRoom[]) => void): () => void {
     this.activeRoomsListeners.add(callback);
     callback(Array.from(this.activeRoomsMap.values()).filter((r) => r.status === "waiting"));
+
+    // Ping network for live rooms immediately
+    this.publish(LOBBY_DISCOVERY_TOPIC, { type: "DISCOVER_ROOMS_PING" });
+
     return () => {
       this.activeRoomsListeners.delete(callback);
     };
@@ -598,7 +683,7 @@ class MultiplayerSyncManager {
     roomId: string,
     callback: (room: GameRoom | null) => void
   ): () => void {
-    const formattedId = roomId.trim().toUpperCase();
+    const formattedId = normalizeRoomCode(roomId);
     if (!this.roomListeners.has(formattedId)) {
       this.roomListeners.set(formattedId, new Set());
     }
