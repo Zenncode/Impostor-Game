@@ -1,3 +1,4 @@
+import mqtt, { MqttClient } from "mqtt";
 import type { Difficulty, WordEntry } from "../constants/words";
 import type { Clue } from "../types/game";
 import { pickSecretWord } from "./gameHelpers";
@@ -51,106 +52,165 @@ export type GameRoom = {
   updatedAt: number;
 };
 
-const ROOMS_STORAGE_KEY = "impostor_active_online_rooms_v1";
+const LOBBY_DISCOVERY_TOPIC = "impostor-game/v1/lobbies";
+const ROOM_TOPIC_PREFIX = "impostor-game/v1/rooms/";
 
 class MultiplayerSyncManager {
-  private channel: BroadcastChannel | null = null;
-  private roomListeners: Map<string, Set<(room: GameRoom | null) => void>> = new Map();
+  private client: MqttClient | null = null;
+  private currentRoom: GameRoom | null = null;
+  private activeRoomsMap: Map<string, GameRoom> = new Map();
   private activeRoomsListeners: Set<(rooms: GameRoom[]) => void> = new Set();
+  private roomListeners: Map<string, Set<(room: GameRoom | null) => void>> = new Map();
   private heartbeatInterval: NodeJS.Timeout | null = null;
+  private subscribedRoomTopics: Set<string> = new Set();
 
   constructor() {
     if (typeof window !== "undefined") {
-      try {
-        this.channel = new BroadcastChannel("impostor_multiplayer_sync");
-        this.channel.onmessage = (event) => {
-          this.handleBroadcastMessage(event.data);
-        };
-      } catch {
-        // Fallback for environments without BroadcastChannel
-      }
+      this.initMqtt();
 
-      window.addEventListener("storage", (e) => {
-        if (e.key === ROOMS_STORAGE_KEY) {
-          this.notifyActiveRooms();
-          const rooms = this.getAllRoomsFromStorage();
-          this.roomListeners.forEach((listeners, roomId) => {
-            const r = rooms.find((rm) => rm.id === roomId) || null;
-            listeners.forEach((cb) => cb(r));
-          });
+      // Clean stale active lobbies every 4s
+      setInterval(() => {
+        const now = Date.now();
+        let changed = false;
+        this.activeRoomsMap.forEach((room, id) => {
+          if (now - room.updatedAt > 10000) {
+            this.activeRoomsMap.delete(id);
+            changed = true;
+          }
+        });
+        if (changed) this.notifyActiveRooms();
+      }, 4000);
+    }
+  }
+
+  private initMqtt() {
+    try {
+      const clientId = "client_" + Math.random().toString(16).substring(2, 10);
+      this.client = mqtt.connect("wss://broker.emqx.io:8084/mqtt", {
+        clientId,
+        keepalive: 30,
+        reconnectPeriod: 2000,
+        clean: true,
+      });
+
+      this.client.on("connect", () => {
+        // Subscribe to public lobbies channel for discovering active rooms
+        this.client?.subscribe(LOBBY_DISCOVERY_TOPIC);
+
+        // Re-subscribe to current room topic if active
+        if (this.currentRoom) {
+          const roomTopic = ROOM_TOPIC_PREFIX + this.currentRoom.id.toUpperCase();
+          this.client?.subscribe(roomTopic);
         }
       });
 
-      this.heartbeatInterval = setInterval(() => {
-        this.cleanStaleRooms();
-      }, 15000);
+      this.client.on("message", (topic, message) => {
+        try {
+          const payload = JSON.parse(message.toString());
+          if (topic === LOBBY_DISCOVERY_TOPIC) {
+            this.handleLobbyDiscoveryMessage(payload);
+          } else if (topic.startsWith(ROOM_TOPIC_PREFIX)) {
+            const roomId = topic.replace(ROOM_TOPIC_PREFIX, "");
+            this.handleRoomMessage(roomId, payload);
+          }
+        } catch {
+          // ignore parsing errors
+        }
+      });
+
+      this.client.on("error", (err) => {
+        console.warn("MQTT connection notice:", err.message);
+      });
+    } catch (e) {
+      console.warn("Failed to initialize online multiplayer sync:", e);
     }
   }
 
-  private handleBroadcastMessage(data: { type: string; roomId?: string; room?: GameRoom }) {
-    if (data.type === "ROOM_UPDATED" && data.room) {
-      this.saveRoomToStorage(data.room);
-      this.notifyRoomListeners(data.room.id, data.room);
+  private handleLobbyDiscoveryMessage(data: { type: string; room?: GameRoom; roomId?: string }) {
+    if (data.type === "LOBBY_HEARTBEAT" && data.room) {
+      this.activeRoomsMap.set(data.room.id, data.room);
       this.notifyActiveRooms();
-    } else if (data.type === "ROOM_DELETED" && data.roomId) {
-      this.deleteRoomFromStorage(data.roomId);
-      this.notifyRoomListeners(data.roomId, null);
-      this.notifyActiveRooms();
-    } else if (data.type === "ROOMS_SYNC_REQUEST") {
+    } else if (data.type === "LOBBY_CLOSED" && data.roomId) {
+      this.activeRoomsMap.delete(data.roomId);
       this.notifyActiveRooms();
     }
   }
 
-  public getAllRoomsFromStorage(): GameRoom[] {
-    if (typeof window === "undefined") return [];
-    try {
-      const raw = localStorage.getItem(ROOMS_STORAGE_KEY);
-      return raw ? JSON.parse(raw) : [];
-    } catch {
-      return [];
-    }
-  }
+  private handleRoomMessage(roomId: string, data: any) {
+    const isHost = this.currentRoom?.hostId && this.currentRoom.players.find((p) => p.isHost)?.id === this.currentRoom.hostId;
 
-  private saveRoomToStorage(room: GameRoom) {
-    if (typeof window === "undefined") return;
-    try {
-      const rooms = this.getAllRoomsFromStorage();
-      const idx = rooms.findIndex((r) => r.id === room.id);
-      if (idx >= 0) {
-        rooms[idx] = room;
-      } else {
-        rooms.unshift(room);
+    if (data.type === "ROOM_STATE" && data.room) {
+      this.currentRoom = data.room;
+      this.notifyRoomListeners(roomId, data.room);
+      this.activeRoomsMap.set(data.room.id, data.room);
+      this.notifyActiveRooms();
+    } else if (data.type === "PLAYER_JOIN_REQUEST" && data.player) {
+      // If we are the host of this room, handle the join request
+      if (this.currentRoom && this.currentRoom.id === roomId && this.currentRoom.players[0]?.id === this.getCurrentPlayerId()) {
+        const room = this.currentRoom;
+        if (room.status === "waiting" && room.players.length < room.maxPlayers) {
+          const existingIdx = room.players.findIndex((p) => p.id === data.player.id);
+          if (existingIdx >= 0) {
+            room.players[existingIdx].name = data.player.name;
+            room.players[existingIdx].avatar = data.player.avatar;
+          } else {
+            room.players.push({
+              id: data.player.id,
+              name: data.player.name,
+              avatar: data.player.avatar,
+              isHost: false,
+              isReady: true,
+              isAlive: true,
+              suspicion: 15,
+            });
+          }
+          room.updatedAt = Date.now();
+          this.broadcastRoomState(room);
+        }
       }
-      localStorage.setItem(ROOMS_STORAGE_KEY, JSON.stringify(rooms));
-    } catch (e) {
-      console.error("Failed to save room:", e);
+    } else if (data.type === "PLAYER_LEAVE_REQUEST" && data.playerId) {
+      if (this.currentRoom && this.currentRoom.id === roomId && this.currentRoom.players[0]?.id === this.getCurrentPlayerId()) {
+        const room = this.currentRoom;
+        room.players = room.players.filter((p) => p.id !== data.playerId);
+        if (room.players.length === 0) {
+          this.deleteRoom(roomId);
+        } else {
+          room.updatedAt = Date.now();
+          this.broadcastRoomState(room);
+        }
+      }
+    } else if (data.type === "SUBMIT_CLUE_REQUEST" && data.clueText && data.playerId) {
+      if (this.currentRoom && this.currentRoom.id === roomId && this.currentRoom.players[0]?.id === this.getCurrentPlayerId()) {
+        this.processClueSubmission(this.currentRoom, data.clueText, data.playerId);
+      }
+    } else if (data.type === "CAST_VOTE_REQUEST" && data.voterId && data.targetId) {
+      if (this.currentRoom && this.currentRoom.id === roomId && this.currentRoom.players[0]?.id === this.getCurrentPlayerId()) {
+        this.processVote(this.currentRoom, data.voterId, data.targetId);
+      }
+    } else if (data.type === "SUBMIT_GUESS_REQUEST" && data.guessText) {
+      if (this.currentRoom && this.currentRoom.id === roomId && this.currentRoom.players[0]?.id === this.getCurrentPlayerId()) {
+        this.processFinalGuess(this.currentRoom, data.guessText);
+      }
     }
   }
 
-  private deleteRoomFromStorage(roomId: string) {
-    if (typeof window === "undefined") return;
-    try {
-      const rooms = this.getAllRoomsFromStorage().filter((r) => r.id !== roomId);
-      localStorage.setItem(ROOMS_STORAGE_KEY, JSON.stringify(rooms));
-    } catch (e) {
-      console.error("Failed to delete room:", e);
-    }
+  private getCurrentPlayerId(): string {
+    if (typeof window === "undefined") return "";
+    return localStorage.getItem("impostor_player_id") || "";
   }
 
-  private cleanStaleRooms() {
-    const now = Date.now();
-    const rooms = this.getAllRoomsFromStorage().filter(
-      (r) => now - r.updatedAt < 1000 * 60 * 60
-    );
-    if (typeof window !== "undefined") {
-      localStorage.setItem(ROOMS_STORAGE_KEY, JSON.stringify(rooms));
-      this.notifyActiveRooms();
-    }
+  private broadcastRoomState(room: GameRoom) {
+    this.currentRoom = room;
+    const topic = ROOM_TOPIC_PREFIX + room.id.toUpperCase();
+    this.publish(topic, { type: "ROOM_STATE", room });
+    this.notifyRoomListeners(room.id, room);
+    this.activeRoomsMap.set(room.id, room);
+    this.notifyActiveRooms();
   }
 
-  private broadcast(data: { type: string; roomId?: string; room?: GameRoom }) {
-    if (this.channel) {
-      this.channel.postMessage(data);
+  private publish(topic: string, data: any) {
+    if (this.client && this.client.connected) {
+      this.client.publish(topic, JSON.stringify(data));
     }
   }
 
@@ -162,11 +222,115 @@ class MultiplayerSyncManager {
   }
 
   private notifyActiveRooms() {
-    const rooms = this.getAllRoomsFromStorage();
+    const rooms = Array.from(this.activeRoomsMap.values()).filter(
+      (r) => r.status === "waiting"
+    );
     this.activeRoomsListeners.forEach((cb) => cb(rooms));
   }
 
-  // --- PUBLIC API ---
+  // --- HOST PROCESSING ACTIONS ---
+
+  private processClueSubmission(room: GameRoom, clueText: string, playerId: string) {
+    const player = room.players.find((p) => p.id === playerId);
+    if (!player) return;
+
+    const isImpostor = playerId === room.impostorId;
+    const newClue: Clue = {
+      id: "clue-" + Date.now() + "-" + room.clues.length,
+      playerId: player.id,
+      playerName: player.name,
+      text: clueText.trim(),
+      isImpostorClue: isImpostor,
+      timestamp: Date.now(),
+      valid: true,
+    };
+
+    room.clues.push(newClue);
+    const nextTurnIndex = room.turnIndex + 1;
+    room.turnIndex = nextTurnIndex;
+
+    // Check if all players have submitted a clue
+    if (room.clues.length >= room.players.length) {
+      room.matchPhase = "voting";
+      room.votes = {};
+      room.currentTurnPlayerId = null;
+    } else {
+      const alivePlayers = room.players.filter((p) => p.isAlive);
+      const nextPlayer = alivePlayers[nextTurnIndex % alivePlayers.length];
+      room.currentTurnPlayerId = nextPlayer ? nextPlayer.id : null;
+    }
+
+    room.updatedAt = Date.now();
+    this.broadcastRoomState(room);
+  }
+
+  private processVote(room: GameRoom, voterId: string, targetId: string) {
+    room.votes[voterId] = targetId;
+    const alivePlayers = room.players.filter((p) => p.isAlive);
+    const allVoted = alivePlayers.every((p) => Boolean(room.votes[p.id]));
+
+    if (allVoted) {
+      const tally: Record<string, number> = {};
+      Object.values(room.votes).forEach((t) => {
+        tally[t] = (tally[t] || 0) + 1;
+      });
+
+      let highestVotes = 0;
+      let electedTarget = "skip";
+      Object.entries(tally).forEach(([target, count]) => {
+        if (count > highestVotes) {
+          highestVotes = count;
+          electedTarget = target;
+        }
+      });
+
+      const electedPlayer = room.players.find((p) => p.id === electedTarget) || null;
+      const isSkip = electedTarget === "skip";
+      const wasImpostor = electedPlayer ? electedPlayer.id === room.impostorId : false;
+
+      room.ejectionResult = {
+        electedTargetId: electedTarget,
+        electedPlayerName: electedPlayer ? electedPlayer.name : "Skip",
+        electedPlayerAvatar: electedPlayer ? electedPlayer.avatar : "⏩",
+        wasImpostor,
+        isSkip,
+        voteTally: tally,
+      };
+
+      room.matchPhase = "ejection_reveal";
+      room.updatedAt = Date.now();
+      this.broadcastRoomState(room);
+
+      // Transition to Guess Phase after 4.5 seconds
+      setTimeout(() => {
+        if (this.currentRoom && this.currentRoom.id === room.id && this.currentRoom.matchPhase === "ejection_reveal") {
+          this.currentRoom.matchPhase = "guess";
+          this.currentRoom.updatedAt = Date.now();
+          this.broadcastRoomState(this.currentRoom);
+        }
+      }, 4500);
+    } else {
+      room.updatedAt = Date.now();
+      this.broadcastRoomState(room);
+    }
+  }
+
+  private processFinalGuess(room: GameRoom, guessText: string) {
+    if (!room.secretWord) return;
+    const trimmed = guessText.trim().toLowerCase();
+    const isCorrect = trimmed === room.secretWord.word.toLowerCase();
+
+    room.impostorGuess = guessText.trim();
+    room.isGuessCorrect = isCorrect;
+    room.winner = isCorrect ? "impostor" : "crewmates";
+    room.matchPhase = "reveal";
+    room.status = "finished";
+    room.updatedAt = Date.now();
+
+    this.broadcastRoomState(room);
+  }
+
+  // --- PUBLIC INTERFACE ---
 
   public createRoom(
     hostPlayer: { id: string; name: string; avatar: string },
@@ -216,10 +380,25 @@ class MultiplayerSyncManager {
       updatedAt: now,
     };
 
-    this.saveRoomToStorage(newRoom);
-    this.broadcast({ type: "ROOM_UPDATED", room: newRoom });
-    this.notifyRoomListeners(newRoom.id, newRoom);
-    this.notifyActiveRooms();
+    this.currentRoom = newRoom;
+    const roomTopic = ROOM_TOPIC_PREFIX + newRoom.id.toUpperCase();
+    this.client?.subscribe(roomTopic);
+
+    // Start lobby heartbeat to announce room across the internet
+    if (this.heartbeatInterval) clearInterval(this.heartbeatInterval);
+    this.heartbeatInterval = setInterval(() => {
+      if (this.currentRoom && this.currentRoom.id === newRoom.id) {
+        this.currentRoom.updatedAt = Date.now();
+        this.publish(LOBBY_DISCOVERY_TOPIC, {
+          type: "LOBBY_HEARTBEAT",
+          room: this.currentRoom,
+        });
+      }
+    }, 2500);
+
+    // Initial broadcast
+    this.publish(LOBBY_DISCOVERY_TOPIC, { type: "LOBBY_HEARTBEAT", room: newRoom });
+    this.broadcastRoomState(newRoom);
 
     return newRoom;
   }
@@ -228,80 +407,88 @@ class MultiplayerSyncManager {
     roomId: string,
     player: { id: string; name: string; avatar: string }
   ): { success: boolean; error?: string; room?: GameRoom } {
-    const rooms = this.getAllRoomsFromStorage();
-    const room = rooms.find(
-      (r) => r.id.toLowerCase() === roomId.trim().toLowerCase()
-    );
+    const formattedId = roomId.trim().toUpperCase();
+    const roomTopic = ROOM_TOPIC_PREFIX + formattedId;
 
-    if (!room) {
-      return { success: false, error: "Room not found. Please check room code." };
-    }
+    this.client?.subscribe(roomTopic);
 
-    if (room.status !== "waiting") {
-      return { success: false, error: "Match already in progress in this room." };
-    }
-
-    const existingPlayerIndex = room.players.findIndex((p) => p.id === player.id);
-    if (existingPlayerIndex >= 0) {
-      room.players[existingPlayerIndex].name = player.name;
-      room.players[existingPlayerIndex].avatar = player.avatar;
-    } else {
-      if (room.players.length >= room.maxPlayers) {
-        return { success: false, error: "Room is already full!" };
-      }
-      room.players.push({
+    // Send join request to room host
+    this.publish(roomTopic, {
+      type: "PLAYER_JOIN_REQUEST",
+      player: {
         id: player.id,
         name: player.name,
         avatar: player.avatar,
-        isHost: false,
-        isReady: true,
-        isAlive: true,
-        suspicion: 15,
-      });
+      },
+    });
+
+    const knownRoom = this.activeRoomsMap.get(formattedId);
+    if (knownRoom) {
+      this.currentRoom = knownRoom;
+      return { success: true, room: knownRoom };
     }
 
-    room.updatedAt = Date.now();
-    this.saveRoomToStorage(room);
-    this.broadcast({ type: "ROOM_UPDATED", room });
-    this.notifyRoomListeners(room.id, room);
-    this.notifyActiveRooms();
+    // Temporary room placeholder while waiting for Host response
+    const tempRoom: GameRoom = {
+      id: formattedId,
+      name: "Joining Room...",
+      hostId: "",
+      hostName: "Host",
+      status: "waiting",
+      maxPlayers: 6,
+      difficulty: "medium",
+      gameMode: "classic",
+      players: [
+        {
+          id: player.id,
+          name: player.name,
+          avatar: player.avatar,
+          isHost: false,
+          isReady: true,
+          isAlive: true,
+        },
+      ],
+      secretWord: null,
+      impostorId: null,
+      clues: [],
+      currentTurnPlayerId: null,
+      turnIndex: 0,
+      matchPhase: "waiting",
+      votes: {},
+      ejectionResult: null,
+      winner: null,
+      impostorGuess: null,
+      isGuessCorrect: null,
+      round: 1,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    };
 
-    return { success: true, room };
+    this.currentRoom = tempRoom;
+    return { success: true, room: tempRoom };
   }
 
   public leaveRoom(roomId: string, playerId: string) {
-    const rooms = this.getAllRoomsFromStorage();
-    const room = rooms.find((r) => r.id === roomId);
-    if (!room) return;
+    const formattedId = roomId.trim().toUpperCase();
+    const roomTopic = ROOM_TOPIC_PREFIX + formattedId;
 
-    room.players = room.players.filter((p) => p.id !== playerId);
+    this.publish(roomTopic, {
+      type: "PLAYER_LEAVE_REQUEST",
+      playerId,
+    });
 
-    if (room.players.length === 0) {
-      this.deleteRoomFromStorage(roomId);
-      this.broadcast({ type: "ROOM_DELETED", roomId });
-      this.notifyRoomListeners(roomId, null);
-      this.notifyActiveRooms();
-      return;
+    if (this.heartbeatInterval) {
+      clearInterval(this.heartbeatInterval);
+      this.heartbeatInterval = null;
     }
 
-    if (room.hostId === playerId) {
-      room.players[0].isHost = true;
-      room.hostId = room.players[0].id;
-      room.hostName = room.players[0].name;
-    }
-
-    room.updatedAt = Date.now();
-    this.saveRoomToStorage(room);
-    this.broadcast({ type: "ROOM_UPDATED", room });
-    this.notifyRoomListeners(room.id, room);
-    this.notifyActiveRooms();
+    this.publish(LOBBY_DISCOVERY_TOPIC, { type: "LOBBY_CLOSED", roomId: formattedId });
+    this.currentRoom = null;
   }
 
-  public startMatch(roomId: string): GameRoom | null {
-    const rooms = this.getAllRoomsFromStorage();
-    const room = rooms.find((r) => r.id === roomId);
-    if (!room || room.players.length < 2) return null;
-
+  public startMatch(roomId: string) {
+    if (!this.currentRoom || this.currentRoom.id !== roomId) return;
+    const room = this.currentRoom;
     const word = pickSecretWord(room.difficulty);
 
     const randomIdx = Math.floor(Math.random() * room.players.length);
@@ -329,178 +516,55 @@ class MultiplayerSyncManager {
     room.isGuessCorrect = null;
     room.updatedAt = Date.now();
 
-    this.saveRoomToStorage(room);
-    this.broadcast({ type: "ROOM_UPDATED", room });
-    this.notifyRoomListeners(room.id, room);
-    this.notifyActiveRooms();
+    this.broadcastRoomState(room);
 
     setTimeout(() => {
-      const currentRooms = this.getAllRoomsFromStorage();
-      const current = currentRooms.find((r) => r.id === roomId);
-      if (current && current.matchPhase === "role_reveal") {
-        current.matchPhase = "clue_feed";
-        current.updatedAt = Date.now();
-        this.saveRoomToStorage(current);
-        this.broadcast({ type: "ROOM_UPDATED", room: current });
-        this.notifyRoomListeners(current.id, current);
+      if (this.currentRoom && this.currentRoom.id === roomId && this.currentRoom.matchPhase === "role_reveal") {
+        this.currentRoom.matchPhase = "clue_feed";
+        this.currentRoom.updatedAt = Date.now();
+        this.broadcastRoomState(this.currentRoom);
       }
     }, 2800);
-
-    return room;
   }
 
-  public submitClue(roomId: string, clueText: string, playerId: string): GameRoom | null {
-    const rooms = this.getAllRoomsFromStorage();
-    const room = rooms.find((r) => r.id === roomId);
-    if (!room || room.matchPhase !== "clue_feed") return null;
-
-    const player = room.players.find((p) => p.id === playerId);
-    if (!player) return null;
-
-    const isImpostor = playerId === room.impostorId;
-    const newClue: Clue = {
-      id: "clue-" + Date.now() + "-" + room.clues.length,
-      playerId: player.id,
-      playerName: player.name,
-      text: clueText.trim(),
-      isImpostorClue: isImpostor,
-      timestamp: Date.now(),
-      valid: true,
-    };
-
-    room.clues.push(newClue);
-
-    const nextTurnIndex = room.turnIndex + 1;
-    room.turnIndex = nextTurnIndex;
-
-    // Check if every player has submitted a clue (or clue round complete)
-    const requiredClues = room.players.length;
-    if (room.clues.length >= requiredClues) {
-      // Transition immediately to the VOTING PHASE!
-      room.matchPhase = "voting";
-      room.votes = {};
-      room.currentTurnPlayerId = null;
-    } else {
-      const alivePlayers = room.players.filter((p) => p.isAlive);
-      const nextPlayer = alivePlayers[nextTurnIndex % alivePlayers.length];
-      room.currentTurnPlayerId = nextPlayer ? nextPlayer.id : null;
-    }
-
-    room.updatedAt = Date.now();
-    this.saveRoomToStorage(room);
-    this.broadcast({ type: "ROOM_UPDATED", room });
-    this.notifyRoomListeners(room.id, room);
-    return room;
+  public submitClue(roomId: string, clueText: string, playerId: string) {
+    const formattedId = roomId.trim().toUpperCase();
+    const roomTopic = ROOM_TOPIC_PREFIX + formattedId;
+    this.publish(roomTopic, {
+      type: "SUBMIT_CLUE_REQUEST",
+      clueText,
+      playerId,
+    });
   }
 
-  public castVote(roomId: string, voterId: string, targetId: string): GameRoom | null {
-    const rooms = this.getAllRoomsFromStorage();
-    const room = rooms.find((r) => r.id === roomId);
-    if (!room || (room.matchPhase !== "voting" && room.matchPhase !== "emergency")) return null;
-
-    room.votes[voterId] = targetId;
-
-    const alivePlayers = room.players.filter((p) => p.isAlive);
-    const allVoted = alivePlayers.every((p) => Boolean(room.votes[p.id]));
-
-    if (allVoted) {
-      // Calculate Vote Tally
-      const tally: Record<string, number> = {};
-      Object.values(room.votes).forEach((target) => {
-        tally[target] = (tally[target] || 0) + 1;
-      });
-
-      let highestVotes = 0;
-      let electedTarget = "skip";
-      Object.entries(tally).forEach(([target, count]) => {
-        if (count > highestVotes) {
-          highestVotes = count;
-          electedTarget = target;
-        }
-      });
-
-      const electedPlayer = room.players.find((p) => p.id === electedTarget) || null;
-      const isSkip = electedTarget === "skip";
-      const wasImpostor = electedPlayer ? electedPlayer.id === room.impostorId : false;
-
-      room.ejectionResult = {
-        electedTargetId: electedTarget,
-        electedPlayerName: electedPlayer ? electedPlayer.name : "Skip",
-        electedPlayerAvatar: electedPlayer ? electedPlayer.avatar : "⏩",
-        wasImpostor,
-        isSkip,
-        voteTally: tally,
-      };
-
-      room.matchPhase = "ejection_reveal";
-
-      // Schedule transition to Guess Phase after Ejection Reveal
-      setTimeout(() => {
-        const currentRooms = this.getAllRoomsFromStorage();
-        const cur = currentRooms.find((r) => r.id === roomId);
-        if (cur && cur.matchPhase === "ejection_reveal") {
-          cur.matchPhase = "guess";
-          cur.updatedAt = Date.now();
-          this.saveRoomToStorage(cur);
-          this.broadcast({ type: "ROOM_UPDATED", room: cur });
-          this.notifyRoomListeners(cur.id, cur);
-        }
-      }, 4500);
-    }
-
-    room.updatedAt = Date.now();
-    this.saveRoomToStorage(room);
-    this.broadcast({ type: "ROOM_UPDATED", room });
-    this.notifyRoomListeners(room.id, room);
-    return room;
+  public castVote(roomId: string, voterId: string, targetId: string) {
+    const formattedId = roomId.trim().toUpperCase();
+    const roomTopic = ROOM_TOPIC_PREFIX + formattedId;
+    this.publish(roomTopic, {
+      type: "CAST_VOTE_REQUEST",
+      voterId,
+      targetId,
+    });
   }
 
-  public submitFinalGuess(roomId: string, guessText: string): GameRoom | null {
-    const rooms = this.getAllRoomsFromStorage();
-    const room = rooms.find((r) => r.id === roomId);
-    if (!room || !room.secretWord) return null;
-
-    const trimmed = guessText.trim().toLowerCase();
-    const isCorrect = trimmed === room.secretWord.word.toLowerCase();
-
-    room.impostorGuess = guessText.trim();
-    room.isGuessCorrect = isCorrect;
-
-    // Check if Impostor was already caught in voting:
-    // If Impostor was voted out, they only win if they guessed the secret word correctly!
-    // If Crewmates voted out the Impostor and Impostor guessed wrong -> Crewmates Win!
-    if (isCorrect) {
-      room.winner = "impostor";
-    } else {
-      room.winner = "crewmates";
-    }
-
-    room.matchPhase = "reveal";
-    room.status = "finished";
-    room.updatedAt = Date.now();
-
-    this.saveRoomToStorage(room);
-    this.broadcast({ type: "ROOM_UPDATED", room });
-    this.notifyRoomListeners(room.id, room);
-    this.notifyActiveRooms();
-
-    return room;
+  public submitFinalGuess(roomId: string, guessText: string) {
+    const formattedId = roomId.trim().toUpperCase();
+    const roomTopic = ROOM_TOPIC_PREFIX + formattedId;
+    this.publish(roomTopic, {
+      type: "SUBMIT_GUESS_REQUEST",
+      guessText,
+    });
   }
 
-  public nextRound(roomId: string): GameRoom | null {
-    const rooms = this.getAllRoomsFromStorage();
-    const room = rooms.find((r) => r.id === roomId);
-    if (!room) return null;
-
-    room.round += 1;
-    return this.startMatch(roomId);
+  public nextRound(roomId: string) {
+    if (!this.currentRoom || this.currentRoom.id !== roomId) return;
+    this.currentRoom.round += 1;
+    this.startMatch(roomId);
   }
 
-  public returnRoomToLobby(roomId: string): GameRoom | null {
-    const rooms = this.getAllRoomsFromStorage();
-    const room = rooms.find((r) => r.id === roomId);
-    if (!room) return null;
-
+  public returnRoomToLobby(roomId: string) {
+    if (!this.currentRoom || this.currentRoom.id !== roomId) return;
+    const room = this.currentRoom;
     room.status = "waiting";
     room.matchPhase = "waiting";
     room.secretWord = null;
@@ -513,17 +577,18 @@ class MultiplayerSyncManager {
     room.isGuessCorrect = null;
     room.updatedAt = Date.now();
 
-    this.saveRoomToStorage(room);
-    this.broadcast({ type: "ROOM_UPDATED", room });
-    this.notifyRoomListeners(room.id, room);
-    this.notifyActiveRooms();
+    this.broadcastRoomState(room);
+  }
 
-    return room;
+  private deleteRoom(roomId: string) {
+    this.activeRoomsMap.delete(roomId);
+    this.publish(LOBBY_DISCOVERY_TOPIC, { type: "LOBBY_CLOSED", roomId });
+    this.notifyActiveRooms();
   }
 
   public subscribeToActiveRooms(callback: (rooms: GameRoom[]) => void): () => void {
     this.activeRoomsListeners.add(callback);
-    callback(this.getAllRoomsFromStorage());
+    callback(Array.from(this.activeRoomsMap.values()).filter((r) => r.status === "waiting"));
     return () => {
       this.activeRoomsListeners.delete(callback);
     };
@@ -533,20 +598,23 @@ class MultiplayerSyncManager {
     roomId: string,
     callback: (room: GameRoom | null) => void
   ): () => void {
-    if (!this.roomListeners.has(roomId)) {
-      this.roomListeners.set(roomId, new Set());
+    const formattedId = roomId.trim().toUpperCase();
+    if (!this.roomListeners.has(formattedId)) {
+      this.roomListeners.set(formattedId, new Set());
     }
-    this.roomListeners.get(roomId)!.add(callback);
+    this.roomListeners.get(formattedId)!.add(callback);
 
-    const rooms = this.getAllRoomsFromStorage();
-    const current = rooms.find((r) => r.id.toLowerCase() === roomId.toLowerCase()) || null;
+    const roomTopic = ROOM_TOPIC_PREFIX + formattedId;
+    this.client?.subscribe(roomTopic);
+
+    const current = this.currentRoom || this.activeRoomsMap.get(formattedId) || null;
     callback(current);
 
     return () => {
-      const set = this.roomListeners.get(roomId);
+      const set = this.roomListeners.get(formattedId);
       if (set) {
         set.delete(callback);
-        if (set.size === 0) this.roomListeners.delete(roomId);
+        if (set.size === 0) this.roomListeners.delete(formattedId);
       }
     };
   }
