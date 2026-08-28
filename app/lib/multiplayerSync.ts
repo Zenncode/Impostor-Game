@@ -25,6 +25,15 @@ export type EjectionResult = {
   voteTally: Record<string, number>;
 };
 
+export type ChatMessage = {
+  id: string;
+  senderId: string;
+  senderName: string;
+  senderAvatar: string;
+  text: string;
+  timestamp: number;
+};
+
 export type GameRoom = {
   id: string; // e.g. "PINK-8472"
   name: string;
@@ -38,6 +47,7 @@ export type GameRoom = {
   secretWord: WordEntry | null;
   impostorId: string | null;
   clues: Clue[];
+  messages: ChatMessage[];
   currentTurnPlayerId: string | null;
   turnIndex: number;
   matchPhase: "waiting" | "role_reveal" | "clue_feed" | "voting" | "ejection_reveal" | "emergency" | "guess" | "reveal";
@@ -95,7 +105,7 @@ class MultiplayerSyncManager {
 
       this.connectBroker(0);
 
-      // Periodically clean stale rooms (older than 8s without heartbeat)
+      // Clean stale active lobbies
       setInterval(() => {
         const now = Date.now();
         let changed = false;
@@ -130,13 +140,11 @@ class MultiplayerSyncManager {
           this.client?.subscribe(ROOM_TOPIC_PREFIX + this.currentRoom.id.toUpperCase());
         }
 
-        // Flush queued messages
         while (this.messageQueue.length > 0) {
           const item = this.messageQueue.shift();
           if (item) this.publish(item.topic, item.data);
         }
 
-        // Request all active rooms on network
         this.publish(LOBBY_DISCOVERY_TOPIC, { type: "DISCOVER_ROOMS_PING" });
       });
 
@@ -150,7 +158,6 @@ class MultiplayerSyncManager {
       });
 
       this.client.on("error", () => {
-        // Try fallback broker on error
         setTimeout(() => {
           if (!this.client?.connected) {
             this.client?.end(true);
@@ -172,7 +179,6 @@ class MultiplayerSyncManager {
         this.activeRoomsMap.delete(payload.roomId);
         this.notifyActiveRooms();
       } else if (payload.type === "DISCOVER_ROOMS_PING") {
-        // If we are currently hosting a waiting room, immediately broadcast heartbeat
         if (this.currentRoom && this.isCurrentPlayerHost()) {
           this.publish(LOBBY_DISCOVERY_TOPIC, {
             type: "LOBBY_HEARTBEAT",
@@ -195,12 +201,35 @@ class MultiplayerSyncManager {
       this.activeRoomsMap.set(data.room.id, data.room);
       this.notifyActiveRooms();
 
-      // Stop join retry interval if we received valid room state with us inside
       if (this.joinRetryInterval) {
         const myId = this.getCurrentPlayerId();
         if (data.room.players.some((p: RoomPlayer) => p.id === myId)) {
           clearInterval(this.joinRetryInterval);
           this.joinRetryInterval = null;
+        }
+      }
+    } else if (data.type === "CHAT_MESSAGE_BROADCAST" && data.message) {
+      if (this.currentRoom && this.currentRoom.id === roomId) {
+        if (!this.currentRoom.messages) this.currentRoom.messages = [];
+        if (!this.currentRoom.messages.some((m) => m.id === data.message.id)) {
+          this.currentRoom.messages.push(data.message);
+          this.notifyRoomListeners(roomId, this.currentRoom);
+        }
+      }
+    } else if (data.type === "CHAT_MESSAGE_REQUEST" && data.message) {
+      if (this.currentRoom && this.currentRoom.id === roomId) {
+        if (!this.currentRoom.messages) this.currentRoom.messages = [];
+        if (!this.currentRoom.messages.some((m) => m.id === data.message.id)) {
+          this.currentRoom.messages.push(data.message);
+          if (this.currentRoom.messages.length > 60) {
+            this.currentRoom.messages.shift();
+          }
+        }
+        if (isHost) {
+          this.currentRoom.updatedAt = Date.now();
+          this.broadcastRoomState(this.currentRoom);
+        } else {
+          this.notifyRoomListeners(roomId, this.currentRoom);
         }
       }
     } else if (data.type === "PLAYER_JOIN_REQUEST" && data.player) {
@@ -439,6 +468,7 @@ class MultiplayerSyncManager {
       secretWord: null,
       impostorId: null,
       clues: [],
+      messages: [],
       currentTurnPlayerId: null,
       turnIndex: 0,
       matchPhase: "waiting",
@@ -456,7 +486,6 @@ class MultiplayerSyncManager {
     const roomTopic = ROOM_TOPIC_PREFIX + newRoom.id.toUpperCase();
     this.client?.subscribe(roomTopic);
 
-    // Heartbeat every 1.5s
     if (this.heartbeatInterval) clearInterval(this.heartbeatInterval);
     this.heartbeatInterval = setInterval(() => {
       if (this.currentRoom && this.currentRoom.id === newRoom.id) {
@@ -496,7 +525,6 @@ class MultiplayerSyncManager {
 
     sendJoin();
 
-    // Retry sending join request every 800ms until state is synced
     if (this.joinRetryInterval) clearInterval(this.joinRetryInterval);
     this.joinRetryInterval = setInterval(sendJoin, 800);
 
@@ -528,6 +556,7 @@ class MultiplayerSyncManager {
       secretWord: null,
       impostorId: null,
       clues: [],
+      messages: [],
       currentTurnPlayerId: null,
       turnIndex: 0,
       matchPhase: "waiting",
@@ -543,6 +572,34 @@ class MultiplayerSyncManager {
 
     this.currentRoom = tempRoom;
     return { success: true, room: tempRoom };
+  }
+
+  public sendChatMessage(
+    roomId: string,
+    message: { senderId: string; senderName: string; senderAvatar: string; text: string }
+  ) {
+    const formattedId = normalizeRoomCode(roomId);
+    const roomTopic = ROOM_TOPIC_PREFIX + formattedId;
+
+    const chatMsg: ChatMessage = {
+      id: "msg_" + Date.now() + "_" + Math.random().toString(36).substring(2, 6),
+      senderId: message.senderId,
+      senderName: message.senderName,
+      senderAvatar: message.senderAvatar,
+      text: message.text.trim(),
+      timestamp: Date.now(),
+    };
+
+    if (this.currentRoom && this.currentRoom.id === formattedId) {
+      if (!this.currentRoom.messages) this.currentRoom.messages = [];
+      this.currentRoom.messages.push(chatMsg);
+      this.notifyRoomListeners(formattedId, this.currentRoom);
+    }
+
+    this.publish(roomTopic, {
+      type: "CHAT_MESSAGE_REQUEST",
+      message: chatMsg,
+    });
   }
 
   public leaveRoom(roomId: string, playerId: string) {
@@ -671,7 +728,6 @@ class MultiplayerSyncManager {
     this.activeRoomsListeners.add(callback);
     callback(Array.from(this.activeRoomsMap.values()).filter((r) => r.status === "waiting"));
 
-    // Ping network for live rooms immediately
     this.publish(LOBBY_DISCOVERY_TOPIC, { type: "DISCOVER_ROOMS_PING" });
 
     return () => {
