@@ -5,7 +5,7 @@ import SoundSettingsModal from "./components/SoundSettingsModal";
 import RulesModal from "./components/RulesModal";
 import StatsModal from "./components/StatsModal";
 import sound from "./lib/soundSystem";
-import { loadStats, recordGameResult, PlayerStats } from "./lib/stats";
+import { loadStats, PlayerStats } from "./lib/stats";
 import { DIFFICULTY_CONFIG } from "./constants/gameConfig";
 import type { Difficulty } from "./constants/words";
 import { validateClue, generateUniquePinkProfile } from "./lib/gameHelpers";
@@ -15,6 +15,15 @@ import {
 } from "./lib/multiplayerSync";
 
 const DIFF_ORDER: Difficulty[] = ["easy", "medium", "hard", "extremely_hard"];
+
+const QUICK_REACTIONS = [
+  "Ready na! 🚀",
+  "Sino kaya impostor? 👀",
+  "sus 🕵️",
+  "Good luck everyone! 🌸",
+  "Hahaha 😂",
+  "Let's go! 💖",
+];
 
 export default function Home() {
   // Navigation & Modals state
@@ -41,6 +50,12 @@ export default function Home() {
   const [currentRoom, setCurrentRoom] = useState<GameRoom | null>(null);
   const [copiedCode, setCopiedCode] = useState(false);
 
+  // Chat State
+  const [chatInput, setChatInput] = useState("");
+  const [isChatDrawerOpen, setIsChatDrawerOpen] = useState(false);
+  const [unreadChatCount, setUnreadChatCount] = useState(0);
+  const chatBottomRef = useRef<HTMLDivElement | null>(null);
+
   // In-Game Inputs & Interaction
   const [clueInput, setClueInput] = useState("");
   const [guessInput, setGuessInput] = useState("");
@@ -49,9 +64,6 @@ export default function Home() {
   const [hideSecretWord, setHideSecretWord] = useState(false);
   const [hintsAvailable, setHintsAvailable] = useState(2);
   const [unlockedHints, setUnlockedHints] = useState<{ type: string; label: string; value: string }[]>([]);
-  const [timeLeft, setTimeLeft] = useState(75);
-
-  const timerRef = useRef<NodeJS.Timeout | null>(null);
 
   // Initialize Unique Player ID & Profile per Browser
   useEffect(() => {
@@ -67,7 +79,6 @@ export default function Home() {
     let savedName = localStorage.getItem("impostor_player_name");
     let savedAvatar = localStorage.getItem("impostor_player_avatar");
 
-    // Enforce unique cute pink name if empty or starts with Player or Guest
     const isGeneric = !savedName || savedName.toLowerCase().startsWith("player") || savedName.toLowerCase().startsWith("guest");
     if (isGeneric) {
       const generated = generateUniquePinkProfile();
@@ -106,6 +117,11 @@ export default function Home() {
   useEffect(() => {
     if (!currentRoom?.id) return;
     const unsubscribe = multiplayerSync.subscribeToRoom(currentRoom.id, (room) => {
+      if (room?.messages && room.messages.length > (currentRoom.messages?.length || 0)) {
+        if (!isChatDrawerOpen) {
+          setUnreadChatCount((prev) => prev + 1);
+        }
+      }
       setCurrentRoom(room);
       if (room?.matchPhase === "role_reveal") {
         sound.playRoleReveal();
@@ -116,22 +132,26 @@ export default function Home() {
       }
     });
     return () => unsubscribe();
-  }, [currentRoom?.id]);
+  }, [currentRoom?.id, isChatDrawerOpen, currentRoom?.messages?.length]);
 
-  // Turn timer
+  // Auto-scroll chat to bottom
   useEffect(() => {
-    if (!currentRoom || currentRoom.status !== "in_game") return;
-    if (currentRoom.matchPhase !== "clue_feed" && currentRoom.matchPhase !== "voting" && currentRoom.matchPhase !== "guess") return;
+    chatBottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [currentRoom?.messages?.length, isChatDrawerOpen]);
 
-    setTimeLeft(currentRoom.gameMode === "blitz" ? 45 : 60);
-    timerRef.current = setInterval(() => {
-      setTimeLeft((prev) => (prev > 0 ? prev - 1 : 0));
-    }, 1000);
-
-    return () => {
-      if (timerRef.current) clearInterval(timerRef.current);
-    };
-  }, [currentRoom?.status, currentRoom?.matchPhase, currentRoom?.turnIndex]);
+  // Handle Send Chat Message
+  const handleSendChat = (customText?: string) => {
+    const text = (customText || chatInput).trim();
+    if (!text || !currentRoom) return;
+    sound.playClick();
+    multiplayerSync.sendChatMessage(currentRoom.id, {
+      senderId: playerId,
+      senderName: playerName || "PinkPlayer",
+      senderAvatar: playerAvatar,
+      text,
+    });
+    if (!customText) setChatInput("");
+  };
 
   // Handle Create Lobby
   const handleCreateLobby = () => {
@@ -176,6 +196,8 @@ export default function Home() {
     setValidationError(null);
     setSelectedVoteTarget(null);
     setUnlockedHints([]);
+    setIsChatDrawerOpen(false);
+    setUnreadChatCount(0);
   };
 
   // Handle Start Match (Host Only)
@@ -240,25 +262,6 @@ export default function Home() {
     multiplayerSync.submitFinalGuess(currentRoom.id, trimmed);
   };
 
-  // Handle Unlock Hint
-  const handleUseHint = () => {
-    if (!currentRoom || !currentRoom.secretWord || hintsAvailable <= 0) return;
-    sound.playHint();
-    setHintsAvailable((prev) => prev - 1);
-
-    const word = currentRoom.secretWord;
-    const hintList = [
-      { type: "category", label: "Category", value: word.category },
-      { type: "first_letter", label: "First Letter", value: `"${word.word[0].toUpperCase()}"` },
-      { type: "length", label: "Word Length", value: `${word.word.length} letters` },
-    ];
-
-    const available = hintList.filter((h) => !unlockedHints.some((u) => u.type === h.type));
-    if (available.length > 0) {
-      setUnlockedHints((prev) => [...prev, available[0]]);
-    }
-  };
-
   // Copy Room Code
   const handleCopyCode = (code: string) => {
     sound.playClick();
@@ -272,11 +275,113 @@ export default function Home() {
   const isImpostor = currentRoom?.impostorId === playerId;
 
   // -------------------------------------------------------------
-  // RENDER: MAIN HOME & ACTIVE LOBBIES (TWO COLUMNS)
+  // RENDER: CHAT BOX COMPONENT
+  // -------------------------------------------------------------
+  const renderChatBox = () => {
+    const messages = currentRoom?.messages || [];
+
+    return (
+      <div className="flex flex-col h-full bg-pink-950/50 border border-pink-500/25 rounded-3xl p-4 shadow-xl">
+        <div className="flex items-center justify-between border-b border-pink-500/20 pb-2.5 mb-2.5">
+          <div className="flex items-center gap-2">
+            <span className="text-lg">💬</span>
+            <span className="font-black text-sm text-white">Room Chat</span>
+            <span className="text-[10px] px-2 py-0.5 rounded-full bg-pink-500/20 text-pink-300 font-bold">
+              {messages.length} msgs
+            </span>
+          </div>
+          {isChatDrawerOpen && (
+            <button
+              onClick={() => setIsChatDrawerOpen(false)}
+              className="w-7 h-7 rounded-xl bg-pink-950/60 hover:bg-pink-900/50 text-pink-300 flex items-center justify-center font-black text-xs cursor-pointer"
+            >
+              ✕
+            </button>
+          )}
+        </div>
+
+        {/* Messages Feed */}
+        <div className="flex-1 overflow-y-auto space-y-2.5 pr-1 min-h-[160px] max-h-[260px]">
+          {messages.length === 0 ? (
+            <div className="h-full flex flex-col items-center justify-center text-center p-4 text-pink-300/50 space-y-1">
+              <span className="text-2xl">💭</span>
+              <span className="text-xs font-bold">No messages yet. Say hello to everyone!</span>
+            </div>
+          ) : (
+            messages.map((m) => {
+              const isMe = m.senderId === playerId;
+              return (
+                <div
+                  key={m.id}
+                  className={`flex items-start gap-2 animate-fadeIn ${
+                    isMe ? "flex-row-reverse" : "flex-row"
+                  }`}
+                >
+                  <span className="text-xl p-1 rounded-xl bg-pink-500/20 border border-pink-500/30">
+                    {m.senderAvatar}
+                  </span>
+                  <div
+                    className={`max-w-[75%] rounded-2xl px-3.5 py-2 text-xs shadow-md ${
+                      isMe
+                        ? "bg-gradient-to-r from-pink-500 to-pink-600 text-white rounded-tr-none"
+                        : "bg-pink-900/50 border border-pink-500/20 text-pink-100 rounded-tl-none"
+                    }`}
+                  >
+                    {!isMe && (
+                      <div className="text-[10px] font-black text-pink-300/90 mb-0.5">
+                        {m.senderName}
+                      </div>
+                    )}
+                    <div className="font-semibold break-words leading-relaxed">{m.text}</div>
+                  </div>
+                </div>
+              );
+            })
+          )}
+          <div ref={chatBottomRef} />
+        </div>
+
+        {/* Quick Reactions Bar */}
+        <div className="flex gap-1.5 overflow-x-auto py-2 border-t border-pink-500/15 mt-2">
+          {QUICK_REACTIONS.map((r, i) => (
+            <button
+              key={i}
+              onClick={() => handleSendChat(r)}
+              className="px-2.5 py-1 rounded-xl bg-pink-950/40 hover:bg-pink-900/40 border border-pink-500/20 text-[11px] text-pink-200 font-bold whitespace-nowrap cursor-pointer transition active:scale-95 shadow-sm"
+            >
+              {r}
+            </button>
+          ))}
+        </div>
+
+        {/* Input Bar */}
+        <div className="flex gap-2 pt-1">
+          <input
+            value={chatInput}
+            onChange={(e) => setChatInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") handleSendChat();
+            }}
+            placeholder="Type a message to the room..."
+            className="flex-1 px-4 py-2.5 rounded-2xl bg-black/40 border border-pink-500/30 text-xs text-white placeholder-pink-300/40 outline-none focus:border-pink-400 focus:ring-1 focus:ring-pink-400"
+          />
+          <button
+            onClick={() => handleSendChat()}
+            className="px-4 py-2.5 rounded-2xl font-black text-xs bg-gradient-to-r from-pink-500 to-pink-600 text-white shadow-md shadow-pink-500/25 hover:brightness-110 cursor-pointer active:scale-95"
+          >
+            Send ✈️
+          </button>
+        </div>
+      </div>
+    );
+  };
+
+  // -------------------------------------------------------------
+  // RENDER: MAIN HOME & ACTIVE LOBBIES
   // -------------------------------------------------------------
   const renderHomeAndLobbies = () => (
     <div className="w-full max-w-6xl mx-auto py-6 sm:py-10 space-y-6 animate-fadeIn">
-      {/* Top Bar: Streak, Points & Modals */}
+      {/* Top Bar */}
       <div className="flex items-center justify-between gap-3 p-3.5 rounded-3xl bg-pink-950/40 border border-pink-500/25 shadow-lg">
         <div className="flex items-center gap-2 px-3 py-1.5 rounded-2xl bg-pink-900/50 border border-pink-500/30 text-xs font-black shadow-inner">
           <span className="text-amber-400">🔥 {stats?.currentStreak || 0}</span>
@@ -318,7 +423,7 @@ export default function Home() {
         </div>
       </div>
 
-      {/* Main Title Banner */}
+      {/* Main Title */}
       <div className="text-center space-y-2">
         <div className="inline-flex items-center gap-2 px-4 py-1 rounded-full bg-pink-500/15 border border-pink-500/30 text-pink-300 text-xs font-black tracking-widest uppercase shadow-sm">
           <span>🌸</span> REAL-TIME MULTIPLAYER WORD DEDUCTION <span>🎭</span>
@@ -330,11 +435,11 @@ export default function Home() {
           </span>
         </h1>
         <p className="text-sm text-pink-200/80 font-medium">
-          Give clues, vote on the Impostor, and make your deduction!
+          Give clues, chat, vote on the Impostor, and make your deduction!
         </p>
       </div>
 
-      {/* Profile Bar with Unique Name & Randomizer */}
+      {/* Profile Bar */}
       <div className="p-4 rounded-3xl bg-pink-950/40 border border-pink-500/25 flex flex-col sm:flex-row items-center justify-between gap-4 shadow-lg">
         <div className="flex items-center gap-3 w-full sm:w-auto">
           <div className="text-3xl p-2.5 rounded-2xl bg-pink-500/20 border border-pink-500/30 shadow-inner">
@@ -362,7 +467,7 @@ export default function Home() {
           </div>
         </div>
         <div className="flex gap-1.5 flex-wrap justify-center">
-          {["🌸", "🎀", "💗", "🦩", "💖", "🎭", "✨", "👑", "🦄", "🍧", "🧁", "🌷"].map((emoji) => (
+          {["🌸", "🎀", "💗", "🦩", "🌺", "💖", "✨", "👑", "🦄", "🍧", "🧁", "🌷", "🐰", "🦊", "🐱", "🐼"].map((emoji) => (
             <button
               key={emoji}
               onClick={() => {
@@ -381,11 +486,9 @@ export default function Home() {
         </div>
       </div>
 
-      {/* TWO COLUMNS: Left (Create Lobby & Join Code) / Right (Live Active Lobbies) */}
+      {/* TWO COLUMNS: Left (Create Lobby) / Right (Live Active Lobbies) */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-        {/* LEFT COLUMN: Create & Join Form */}
         <div className="lg:col-span-7 space-y-6">
-          {/* Create Lobby Card */}
           <div className="p-6 rounded-3xl bg-pink-950/40 border border-pink-500/25 shadow-xl space-y-5">
             <div className="flex items-center gap-2 border-b border-pink-500/20 pb-3">
               <span className="text-2xl">➕</span>
@@ -395,7 +498,6 @@ export default function Home() {
               </div>
             </div>
 
-            {/* Room Name Input */}
             <div className="space-y-1.5">
               <label className="text-xs font-black tracking-wider text-pink-300 uppercase block">
                 Lobby Name
@@ -403,12 +505,11 @@ export default function Home() {
               <input
                 value={createRoomName}
                 onChange={(e) => setCreateRoomName(e.target.value)}
-                placeholder={`${playerName}'s Room`}
+                placeholder={`${playerName || "Pink"}'s Room`}
                 className="w-full px-4 py-3 rounded-2xl bg-black/40 border border-pink-500/30 text-sm text-white placeholder-pink-300/40 outline-none focus:border-pink-400 focus:ring-1 focus:ring-pink-400"
               />
             </div>
 
-            {/* Max Players (3 to 10) */}
             <div className="space-y-1.5">
               <div className="flex justify-between items-center">
                 <label className="text-xs font-black tracking-wider text-pink-300 uppercase">
@@ -436,7 +537,6 @@ export default function Home() {
               </div>
             </div>
 
-            {/* Difficulty Level */}
             <div className="space-y-1.5">
               <label className="text-xs font-black tracking-wider text-pink-300 uppercase block">
                 Difficulty Level
@@ -466,7 +566,6 @@ export default function Home() {
               </div>
             </div>
 
-            {/* Create Button */}
             <button
               onClick={handleCreateLobby}
               className="w-full py-4 rounded-2xl font-black text-sm tracking-wider flex items-center justify-center gap-2 bg-gradient-to-r from-pink-500 via-pink-600 to-pink-500 text-white shadow-xl shadow-pink-500/35 hover:brightness-110 cursor-pointer transition transform active:scale-95"
@@ -475,7 +574,6 @@ export default function Home() {
             </button>
           </div>
 
-          {/* Join with Code Card */}
           <div className="p-5 rounded-3xl bg-pink-950/30 border border-pink-500/20 shadow-lg space-y-3">
             <div className="text-xs font-black tracking-wider text-pink-300 uppercase">
               Join with Room Code
@@ -487,7 +585,7 @@ export default function Home() {
                   setJoinRoomCodeInput(e.target.value);
                   if (joinError) setJoinError(null);
                 }}
-                placeholder="e.g. PINK-7429"
+                placeholder="e.g. PINK-7525"
                 className="flex-1 px-4 py-3 rounded-2xl bg-black/40 border border-pink-500/30 text-sm text-white placeholder-pink-300/40 uppercase tracking-widest font-black outline-none focus:border-pink-400 focus:ring-1 focus:ring-pink-400"
               />
               <button
@@ -503,7 +601,7 @@ export default function Home() {
           </div>
         </div>
 
-        {/* RIGHT COLUMN: Active Online Lobbies Panel */}
+        {/* RIGHT COLUMN: Active Online Lobbies */}
         <div className="lg:col-span-5 space-y-4">
           <div className="p-6 rounded-3xl bg-pink-950/40 border border-pink-500/25 shadow-xl flex flex-col h-full min-h-[450px]">
             <div className="flex items-center justify-between border-b border-pink-500/20 pb-3 mb-4">
@@ -516,7 +614,6 @@ export default function Home() {
               </span>
             </div>
 
-            {/* List of Live Rooms */}
             <div className="flex-1 space-y-3 overflow-y-auto pr-1">
               {activeRooms.length === 0 ? (
                 <div className="h-64 flex flex-col items-center justify-center text-center p-6 space-y-3 text-pink-300/60">
@@ -553,7 +650,6 @@ export default function Home() {
                       </div>
 
                       <div className="flex items-center justify-between pt-2 border-t border-pink-500/10">
-                        {/* Player Avatars */}
                         <div className="flex items-center gap-1">
                           <div className="flex -space-x-1.5">
                             {room.players.map((p) => (
@@ -571,7 +667,6 @@ export default function Home() {
                           </span>
                         </div>
 
-                        {/* Join Button */}
                         <button
                           disabled={isFull || isPlaying}
                           onClick={() => handleJoinLobby(room.id)}
@@ -598,125 +693,133 @@ export default function Home() {
   );
 
   // -------------------------------------------------------------
-  // RENDER: WAITING LOBBY ROOM
+  // RENDER: WAITING LOBBY ROOM (WITH REAL-TIME CHAT)
   // -------------------------------------------------------------
   const renderWaitingLobby = () => {
     if (!currentRoom) return null;
 
     return (
-      <div className="w-full max-w-2xl mx-auto py-8 space-y-6 animate-fadeIn">
-        <div className="p-6 rounded-3xl bg-pink-950/40 border border-pink-500/25 shadow-xl space-y-4">
-          <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 border-b border-pink-500/20 pb-4">
-            <div>
-              <div className="text-[10px] font-black uppercase tracking-widest text-pink-400">
-                MULTIPLAYER WAITING ROOM
-              </div>
-              <h2 className="font-black text-2xl sm:text-3xl text-white">{currentRoom.name}</h2>
-              <div className="text-xs text-pink-300/80 mt-1 flex items-center gap-2">
-                <span>Difficulty: <b className="text-pink-400 capitalize">{currentRoom.difficulty}</b></span>
-                <span>·</span>
-                <span>Mode: <b className="text-pink-400 capitalize">{currentRoom.gameMode}</b></span>
-              </div>
-            </div>
+      <div className="w-full max-w-5xl mx-auto py-6 space-y-6 animate-fadeIn">
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+          {/* Left / Room Details Column */}
+          <div className="lg:col-span-7 space-y-4">
+            <div className="p-6 rounded-3xl bg-pink-950/40 border border-pink-500/25 shadow-xl space-y-4">
+              <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 border-b border-pink-500/20 pb-4">
+                <div>
+                  <div className="text-[10px] font-black uppercase tracking-widest text-pink-400">
+                    MULTIPLAYER WAITING ROOM
+                  </div>
+                  <h2 className="font-black text-2xl sm:text-3xl text-white">{currentRoom.name}</h2>
+                  <div className="text-xs text-pink-300/80 mt-1 flex items-center gap-2">
+                    <span>Difficulty: <b className="text-pink-400 capitalize">{currentRoom.difficulty}</b></span>
+                    <span>·</span>
+                    <span>Mode: <b className="text-pink-400 capitalize">{currentRoom.gameMode}</b></span>
+                  </div>
+                </div>
 
-            {/* Room Code Badge */}
-            <div className="flex items-center gap-2">
-              <div className="px-4 py-2 rounded-2xl bg-black/50 border border-pink-500/40 text-center">
-                <div className="text-[9px] font-bold text-pink-400 uppercase">Room Code</div>
-                <div className="font-black text-lg text-white tracking-widest">{currentRoom.id}</div>
+                <div className="flex items-center gap-2">
+                  <div className="px-4 py-2 rounded-2xl bg-black/50 border border-pink-500/40 text-center">
+                    <div className="text-[9px] font-bold text-pink-400 uppercase">Room Code</div>
+                    <div className="font-black text-lg text-white tracking-widest">{currentRoom.id}</div>
+                  </div>
+                  <button
+                    onClick={() => handleCopyCode(currentRoom.id)}
+                    className="p-3 rounded-2xl bg-pink-500/20 hover:bg-pink-500/30 border border-pink-500/30 text-pink-200 text-sm font-bold cursor-pointer transition active:scale-95"
+                    title="Copy Room Code"
+                  >
+                    {copiedCode ? "✓ Copied" : "📋 Copy"}
+                  </button>
+                </div>
               </div>
-              <button
-                onClick={() => handleCopyCode(currentRoom.id)}
-                className="p-3 rounded-2xl bg-pink-500/20 hover:bg-pink-500/30 border border-pink-500/30 text-pink-200 text-sm font-bold cursor-pointer transition active:scale-95"
-                title="Copy Room Code"
-              >
-                {copiedCode ? "✓ Copied" : "📋 Copy"}
-              </button>
-            </div>
-          </div>
 
-          {/* Connected Real Players List */}
-          <div className="space-y-2.5">
-            <div className="flex justify-between items-center text-xs font-black text-pink-300 uppercase">
-              <span>Connected Players ({currentRoom.players.length}/{currentRoom.maxPlayers})</span>
-              <span className="text-pink-400 font-bold">1 Impostor randomly picked at start</span>
-            </div>
+              {/* Connected Real Players Grid */}
+              <div className="space-y-2.5">
+                <div className="flex justify-between items-center text-xs font-black text-pink-300 uppercase">
+                  <span>Connected Players ({currentRoom.players.length}/{currentRoom.maxPlayers})</span>
+                  <span className="text-pink-400 font-bold">1 Impostor randomly picked at start</span>
+                </div>
 
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-              {currentRoom.players.map((p) => {
-                const isMe = p.id === playerId;
-                return (
-                  <div
-                    key={p.id}
-                    className={`p-3.5 rounded-2xl border flex items-center justify-between gap-3 shadow-md ${
-                      isMe
-                        ? "bg-pink-600/25 border-pink-400 ring-2 ring-pink-500/50"
-                        : "bg-pink-950/40 border-pink-500/20"
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                  {currentRoom.players.map((p) => {
+                    const isMe = p.id === playerId;
+                    return (
+                      <div
+                        key={p.id}
+                        className={`p-3.5 rounded-2xl border flex items-center justify-between gap-3 shadow-md ${
+                          isMe
+                            ? "bg-pink-600/25 border-pink-400 ring-2 ring-pink-500/50"
+                            : "bg-pink-950/40 border-pink-500/20"
+                        }`}
+                      >
+                        <div className="flex items-center gap-3">
+                          <span className="text-2xl">{p.avatar}</span>
+                          <div>
+                            <div className="font-black text-sm text-white flex items-center gap-1.5">
+                              <span>{p.name}</span>
+                              {isMe && <span className="text-[10px] text-pink-300 font-bold">(You)</span>}
+                            </div>
+                            <div className="text-[10px] text-pink-400 font-bold">
+                              {p.isHost ? "👑 Lobby Host" : "Ready to play"}
+                            </div>
+                          </div>
+                        </div>
+                        <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse" />
+                      </div>
+                    );
+                  })}
+
+                  {Array.from({ length: Math.max(0, currentRoom.maxPlayers - currentRoom.players.length) }).map(
+                    (_, i) => (
+                      <div
+                        key={i}
+                        className="p-3.5 rounded-2xl border border-dashed border-pink-500/20 bg-pink-950/10 flex items-center justify-center text-xs text-pink-400/50 font-bold"
+                      >
+                        <span>Waiting for Player {currentRoom.players.length + i + 1}...</span>
+                      </div>
+                    )
+                  )}
+                </div>
+              </div>
+
+              {/* Action Buttons */}
+              <div className="pt-3 border-t border-pink-500/20 flex flex-col sm:flex-row gap-3">
+                <button
+                  onClick={handleLeaveRoom}
+                  className="px-6 py-4 rounded-2xl font-bold text-xs bg-pink-950/40 hover:bg-pink-900/30 border border-pink-500/25 text-pink-300 cursor-pointer transition active:scale-95"
+                >
+                  🚪 LEAVE LOBBY
+                </button>
+
+                {isHost ? (
+                  <button
+                    onClick={handleStartMatch}
+                    disabled={currentRoom.players.length < 2}
+                    className={`flex-1 py-4 rounded-2xl font-black text-sm tracking-wider flex items-center justify-center gap-2 shadow-xl transition cursor-pointer ${
+                      currentRoom.players.length >= 2
+                        ? "bg-gradient-to-r from-pink-500 via-pink-600 to-pink-500 text-white shadow-pink-500/35 hover:brightness-110 active:scale-95 animate-pulse"
+                        : "bg-pink-950/40 text-pink-500/40 border border-pink-500/15 cursor-not-allowed"
                     }`}
                   >
-                    <div className="flex items-center gap-3">
-                      <span className="text-2xl">{p.avatar}</span>
-                      <div>
-                        <div className="font-black text-sm text-white flex items-center gap-1.5">
-                          <span>{p.name}</span>
-                          {isMe && <span className="text-[10px] text-pink-300 font-bold">(You)</span>}
-                        </div>
-                        <div className="text-[10px] text-pink-400 font-bold">
-                          {p.isHost ? "👑 Lobby Host" : "Ready to play"}
-                        </div>
-                      </div>
-                    </div>
-                    <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse" />
+                    <span>▶</span> START MATCH ({currentRoom.players.length} PLAYERS)
+                  </button>
+                ) : (
+                  <div className="flex-1 py-4 rounded-2xl bg-pink-950/30 border border-pink-500/20 text-center font-bold text-xs text-pink-300 animate-pulse flex items-center justify-center">
+                    Waiting for Host ({currentRoom.hostName}) to start the game...
                   </div>
-                );
-              })}
-
-              {/* Empty Slots */}
-              {Array.from({ length: Math.max(0, currentRoom.maxPlayers - currentRoom.players.length) }).map(
-                (_, i) => (
-                  <div
-                    key={i}
-                    className="p-3.5 rounded-2xl border border-dashed border-pink-500/20 bg-pink-950/10 flex items-center justify-center text-xs text-pink-400/50 font-bold"
-                  >
-                    <span>Waiting for Player {currentRoom.players.length + i + 1}...</span>
-                  </div>
-                )
+                )}
+              </div>
+              {validationError && (
+                <div className="text-xs text-rose-400 font-bold text-center">
+                  ⚠️ {validationError}
+                </div>
               )}
             </div>
           </div>
 
-          {/* Action Buttons */}
-          <div className="pt-3 border-t border-pink-500/20 flex flex-col sm:flex-row gap-3">
-            <button
-              onClick={handleLeaveRoom}
-              className="px-6 py-4 rounded-2xl font-bold text-xs bg-pink-950/40 hover:bg-pink-900/30 border border-pink-500/25 text-pink-300 cursor-pointer transition active:scale-95"
-            >
-              🚪 LEAVE LOBBY
-            </button>
-
-            {isHost ? (
-              <button
-                onClick={handleStartMatch}
-                disabled={currentRoom.players.length < 2}
-                className={`flex-1 py-4 rounded-2xl font-black text-sm tracking-wider flex items-center justify-center gap-2 shadow-xl transition cursor-pointer ${
-                  currentRoom.players.length >= 2
-                    ? "bg-gradient-to-r from-pink-500 via-pink-600 to-pink-500 text-white shadow-pink-500/35 hover:brightness-110 active:scale-95"
-                    : "bg-pink-950/40 text-pink-500/40 border border-pink-500/15 cursor-not-allowed"
-                }`}
-              >
-                <span>▶</span> START MATCH ({currentRoom.players.length} PLAYERS)
-              </button>
-            ) : (
-              <div className="flex-1 py-4 rounded-2xl bg-pink-950/30 border border-pink-500/20 text-center font-bold text-xs text-pink-300 animate-pulse flex items-center justify-center">
-                Waiting for Host ({currentRoom.hostName}) to start the game...
-              </div>
-            )}
+          {/* Right / Live Room Chat Column */}
+          <div className="lg:col-span-5 h-full">
+            {renderChatBox()}
           </div>
-          {validationError && (
-            <div className="text-xs text-rose-400 font-bold text-center">
-              ⚠️ {validationError}
-            </div>
-          )}
         </div>
       </div>
     );
@@ -751,7 +854,7 @@ export default function Home() {
   };
 
   // -------------------------------------------------------------
-  // RENDER: CLUE FEED PHASE (TURN BASED FOR REAL PLAYERS)
+  // RENDER: CLUE FEED PHASE
   // -------------------------------------------------------------
   const renderClueFeed = () => {
     if (!currentRoom) return null;
@@ -759,7 +862,6 @@ export default function Home() {
 
     return (
       <div className="max-w-xl mx-auto w-full space-y-5 animate-fadeIn py-4">
-        {/* Top Control Bar */}
         <div className="flex items-center justify-between px-1">
           <div className="text-xs font-black text-pink-300 uppercase tracking-wider flex items-center gap-2">
             <span>Round {currentRoom.round}</span>
@@ -774,7 +876,7 @@ export default function Home() {
           </button>
         </div>
 
-        {/* Secret Word or Impostor Card */}
+        {/* Secret Word Card */}
         <div className="p-4 rounded-3xl bg-pink-950/40 border border-pink-500/20 shadow-lg flex items-center justify-between gap-3">
           <div className="flex items-center gap-3">
             <div className="w-11 h-11 rounded-2xl bg-pink-500/20 border border-pink-500/30 flex items-center justify-center text-2xl">
@@ -799,16 +901,14 @@ export default function Home() {
             </div>
           </div>
 
-          <div className="flex items-center gap-2">
-            {!isImpostor && (
-              <button
-                onClick={() => setHideSecretWord((prev) => !prev)}
-                className="px-2.5 py-1.5 rounded-xl bg-pink-500/10 border border-pink-500/20 text-pink-300 text-xs font-bold hover:bg-pink-500/20 cursor-pointer"
-              >
-                {hideSecretWord ? "👁️ Show" : "🙈 Hide"}
-              </button>
-            )}
-          </div>
+          {!isImpostor && (
+            <button
+              onClick={() => setHideSecretWord((prev) => !prev)}
+              className="px-2.5 py-1.5 rounded-xl bg-pink-500/10 border border-pink-500/20 text-pink-300 text-xs font-bold hover:bg-pink-500/20 cursor-pointer"
+            >
+              {hideSecretWord ? "👁️ Show" : "🙈 Hide"}
+            </button>
+          )}
         </div>
 
         {/* Live Clue Feed */}
@@ -839,7 +939,6 @@ export default function Home() {
             </div>
           ))}
 
-          {/* Turn indicator message */}
           <div className="p-3 rounded-2xl bg-pink-950/30 border border-pink-500/20 text-pink-200 text-xs flex items-center gap-2 animate-pulse">
             <span className="text-base">👉</span>
             <span>
@@ -890,16 +989,14 @@ export default function Home() {
   };
 
   // -------------------------------------------------------------
-  // RENDER: VOTING PHASE (VOTE WHO THE IMPOSTOR IS)
+  // RENDER: VOTING PHASE
   // -------------------------------------------------------------
   const renderVotingPhase = () => {
     if (!currentRoom) return null;
-
     const myVote = currentRoom.votes[playerId];
 
     return (
       <div className="max-w-xl mx-auto w-full py-6 space-y-5 animate-fadeIn">
-        {/* Header */}
         <div className="text-center pb-2 border-b border-pink-500/20 space-y-1">
           <div className="inline-flex items-center gap-2 px-4 py-1 rounded-full bg-pink-500/20 border border-pink-500/40 text-pink-300 text-xs font-black tracking-widest uppercase animate-pulse">
             🗳️ VOTING PHASE: GUESS THE IMPOSTOR
@@ -910,7 +1007,6 @@ export default function Home() {
           </p>
         </div>
 
-        {/* Clues Review Summary */}
         <div className="p-4 rounded-2xl bg-pink-950/40 border border-pink-500/20 space-y-2">
           <div className="text-[10px] font-black text-pink-400 uppercase tracking-wider">
             Clues Submitted This Round:
@@ -928,7 +1024,6 @@ export default function Home() {
           </div>
         </div>
 
-        {/* Player Voting Grid */}
         <div className="space-y-2">
           <div className="text-xs font-black text-pink-300 uppercase px-1 flex justify-between">
             <span>Select a Suspect to Eject</span>
@@ -982,7 +1077,6 @@ export default function Home() {
           </div>
         </div>
 
-        {/* Skip Option */}
         <button
           disabled={Boolean(myVote)}
           onClick={() => setSelectedVoteTarget("skip")}
@@ -995,7 +1089,6 @@ export default function Home() {
           Skip Vote (Not enough evidence)
         </button>
 
-        {/* Confirm Vote Button */}
         {!myVote ? (
           <button
             disabled={!selectedVoteTarget}
@@ -1083,7 +1176,6 @@ export default function Home() {
           </p>
         </div>
 
-        {/* Clues Summary */}
         <div className="flex flex-wrap gap-1.5 justify-center">
           {currentRoom.clues.map((c, i) => (
             <span
@@ -1154,7 +1246,6 @@ export default function Home() {
           </p>
         </div>
 
-        {/* Word Card */}
         <div className="p-5 rounded-3xl bg-pink-950/50 border border-pink-500/30 shadow-2xl space-y-2">
           <div className="text-[10px] font-black uppercase text-pink-400 tracking-widest">
             SECRET WORD WAS
@@ -1167,7 +1258,6 @@ export default function Home() {
           </div>
         </div>
 
-        {/* Controls */}
         <div className="flex gap-3 pt-2">
           {isHost && (
             <button
@@ -1206,12 +1296,39 @@ export default function Home() {
         {currentRoom && currentRoom.matchPhase === "reveal" && renderReveal()}
       </main>
 
+      {/* Floating In-Match Chat Button & Drawer */}
+      {currentRoom && currentRoom.matchPhase !== "waiting" && (
+        <>
+          <button
+            onClick={() => {
+              setIsChatDrawerOpen((prev) => !prev);
+              setUnreadChatCount(0);
+            }}
+            className="fixed bottom-6 right-6 z-40 px-4 py-3 rounded-full bg-gradient-to-r from-pink-500 to-pink-600 text-white font-black text-xs shadow-2xl shadow-pink-500/50 flex items-center gap-2 cursor-pointer hover:scale-105 active:scale-95 transition"
+          >
+            <span className="text-base">💬</span>
+            <span>Chat</span>
+            {unreadChatCount > 0 && (
+              <span className="w-5 h-5 rounded-full bg-amber-400 text-zinc-950 font-black text-[10px] flex items-center justify-center animate-bounce">
+                {unreadChatCount}
+              </span>
+            )}
+          </button>
+
+          {isChatDrawerOpen && (
+            <div className="fixed bottom-20 right-4 sm:right-6 z-50 w-[92vw] max-w-sm h-[400px] shadow-2xl animate-popIn">
+              {renderChatBox()}
+            </div>
+          )}
+        </>
+      )}
+
       <SoundSettingsModal isOpen={isSoundOpen} onClose={() => setIsSoundOpen(false)} />
       <RulesModal isOpen={isRulesOpen} onClose={() => setIsRulesOpen(false)} />
       <StatsModal isOpen={isStatsOpen} onClose={() => setIsStatsOpen(false)} />
 
       <footer className="w-full border-t border-pink-500/10 py-4 text-center text-xs text-pink-300/40 relative z-10">
-        Impostor Word Guesser · Pink Edition · Real-Time Multiplayer
+        Impostor Word Guesser · Pink Edition · Real-Time Multiplayer & Live Chat
       </footer>
     </div>
   );
