@@ -12,7 +12,6 @@ import { validateClue, formatTime } from "./lib/gameHelpers";
 import {
   multiplayerSync,
   GameRoom,
-  RoomPlayer,
 } from "./lib/multiplayerSync";
 
 const DIFF_ORDER: Difficulty[] = ["easy", "medium", "hard", "extremely_hard"];
@@ -50,8 +49,6 @@ export default function Home() {
   const [hideSecretWord, setHideSecretWord] = useState(false);
   const [hintsAvailable, setHintsAvailable] = useState(2);
   const [unlockedHints, setUnlockedHints] = useState<{ type: string; label: string; value: string }[]>([]);
-  const [showConfetti, setShowConfetti] = useState(false);
-  const [emergencyMeetingsLeft, setEmergencyMeetingsLeft] = useState(3);
   const [timeLeft, setTimeLeft] = useState(75);
 
   const timerRef = useRef<NodeJS.Timeout | null>(null);
@@ -94,8 +91,10 @@ export default function Home() {
       setCurrentRoom(room);
       if (room?.matchPhase === "role_reveal") {
         sound.playRoleReveal();
-      } else if (room?.matchPhase === "emergency") {
+      } else if (room?.matchPhase === "voting") {
         sound.playEmergency();
+      } else if (room?.matchPhase === "ejection_reveal") {
+        sound.playRoleReveal();
       }
     });
     return () => unsubscribe();
@@ -104,9 +103,9 @@ export default function Home() {
   // Turn timer
   useEffect(() => {
     if (!currentRoom || currentRoom.status !== "in_game") return;
-    if (currentRoom.matchPhase !== "clue_feed" && currentRoom.matchPhase !== "guess") return;
+    if (currentRoom.matchPhase !== "clue_feed" && currentRoom.matchPhase !== "voting" && currentRoom.matchPhase !== "guess") return;
 
-    setTimeLeft(currentRoom.gameMode === "blitz" ? 45 : 75);
+    setTimeLeft(currentRoom.gameMode === "blitz" ? 45 : 60);
     timerRef.current = setInterval(() => {
       setTimeLeft((prev) => (prev > 0 ? prev - 1 : 0));
     }, 1000);
@@ -157,6 +156,7 @@ export default function Home() {
     setClueInput("");
     setGuessInput("");
     setValidationError(null);
+    setSelectedVoteTarget(null);
     setUnlockedHints([]);
   };
 
@@ -171,7 +171,6 @@ export default function Home() {
     setValidationError(null);
     setHintsAvailable(currentRoom.difficulty === "easy" ? 3 : currentRoom.difficulty === "medium" ? 2 : 1);
     setUnlockedHints([]);
-    setEmergencyMeetingsLeft(3);
     multiplayerSync.startMatch(currentRoom.id);
   };
 
@@ -203,14 +202,7 @@ export default function Home() {
     setClueInput("");
   };
 
-  // Handle Emergency Meeting
-  const handleCallEmergency = () => {
-    if (!currentRoom || emergencyMeetingsLeft <= 0) return;
-    setEmergencyMeetingsLeft((prev) => prev - 1);
-    multiplayerSync.triggerEmergencyMeeting(currentRoom.id, playerId);
-  };
-
-  // Handle Vote in Emergency Meeting
+  // Handle Vote in Voting Phase
   const handleConfirmVote = () => {
     if (!currentRoom || !selectedVoteTarget) return;
     sound.playVoteCast();
@@ -260,7 +252,6 @@ export default function Home() {
   const isHost = currentRoom?.hostId === playerId;
   const isMyTurn = currentRoom?.currentTurnPlayerId === playerId;
   const isImpostor = currentRoom?.impostorId === playerId;
-  const myPlayer = currentRoom?.players.find((p) => p.id === playerId);
 
   // -------------------------------------------------------------
   // RENDER: MAIN HOME & ACTIVE LOBBIES (TWO COLUMNS)
@@ -321,7 +312,7 @@ export default function Home() {
           </span>
         </h1>
         <p className="text-sm text-pink-200/80 font-medium">
-          Create or join an online lobby to play live with real players!
+          Give clues, vote on the Impostor, and make your deduction!
         </p>
       </div>
 
@@ -587,7 +578,6 @@ export default function Home() {
 
     return (
       <div className="w-full max-w-2xl mx-auto py-8 space-y-6 animate-fadeIn">
-        {/* Header Bar */}
         <div className="p-6 rounded-3xl bg-pink-950/40 border border-pink-500/25 shadow-xl space-y-4">
           <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 border-b border-pink-500/20 pb-4">
             <div>
@@ -725,7 +715,7 @@ export default function Home() {
           </h2>
           <p className="text-sm text-pink-200/80">
             {isImpostor
-              ? "You do NOT know the secret word! Deduce it from the real players' clues and bluff your way through."
+              ? "You do NOT know the secret word! Bluff your clue and deduce the word before voting!"
               : `The secret word is "${currentRoom.secretWord?.word.toUpperCase()}" in [${currentRoom.secretWord?.category}]. Give subtle clues!`}
           </p>
         </div>
@@ -791,26 +781,13 @@ export default function Home() {
                 {hideSecretWord ? "👁️ Show" : "🙈 Hide"}
               </button>
             )}
-            {!isImpostor && (
-              <button
-                onClick={handleCallEmergency}
-                disabled={emergencyMeetingsLeft <= 0}
-                className={`px-3 py-1.5 rounded-xl text-xs font-black flex items-center gap-1.5 cursor-pointer shadow-md transition ${
-                  emergencyMeetingsLeft > 0
-                    ? "bg-gradient-to-r from-rose-500 to-pink-600 text-white shadow-rose-500/30 active:scale-95 animate-pulse"
-                    : "bg-zinc-800 text-zinc-500 cursor-not-allowed"
-                }`}
-              >
-                <span>🚨</span> Meeting ({emergencyMeetingsLeft})
-              </button>
-            )}
           </div>
         </div>
 
         {/* Live Clue Feed */}
         <div className="space-y-2.5 max-h-72 overflow-y-auto pr-1">
           <div className="text-[11px] font-black uppercase text-pink-300/80 px-1">
-            Live Clue Feed ({currentRoom.clues.length})
+            Live Clue Feed ({currentRoom.clues.length}/{currentRoom.players.length})
           </div>
 
           {currentRoom.clues.map((c, i) => (
@@ -886,81 +863,178 @@ export default function Home() {
   };
 
   // -------------------------------------------------------------
-  // RENDER: EMERGENCY MEETING / LIVE VOTING
+  // RENDER: VOTING PHASE (VOTE WHO THE IMPOSTOR IS)
   // -------------------------------------------------------------
-  const renderEmergencyMeeting = () => {
+  const renderVotingPhase = () => {
     if (!currentRoom) return null;
 
+    const myVote = currentRoom.votes[playerId];
+
     return (
-      <div className="max-w-xl mx-auto w-full py-8 space-y-6 animate-fadeIn">
-        <div className="text-center pb-3 border-b border-pink-500/20">
-          <div className="inline-flex items-center gap-2 px-4 py-1.5 rounded-full bg-pink-500/20 border border-pink-500/40 text-pink-300 text-xs font-black tracking-widest uppercase animate-pulse">
-            🚨 EMERGENCY MEETING CALLED BY {currentRoom.emergencyCaller?.toUpperCase()} 🚨
+      <div className="max-w-xl mx-auto w-full py-6 space-y-5 animate-fadeIn">
+        {/* Header */}
+        <div className="text-center pb-2 border-b border-pink-500/20 space-y-1">
+          <div className="inline-flex items-center gap-2 px-4 py-1 rounded-full bg-pink-500/20 border border-pink-500/40 text-pink-300 text-xs font-black tracking-widest uppercase animate-pulse">
+            🗳️ VOTING PHASE: GUESS THE IMPOSTOR
           </div>
-          <h2 className="text-3xl font-black text-white mt-2">Vote to Eject the Impostor</h2>
-          <p className="text-xs text-pink-300/70">Analyze clues given and vote on who looks suspicious!</p>
+          <h2 className="text-2xl sm:text-3xl font-black text-white">Who is the Impostor?</h2>
+          <p className="text-xs text-pink-300/80">
+            Review the clues given and vote for the player you suspect!
+          </p>
         </div>
 
-        <div className="grid grid-cols-2 gap-3">
-          {currentRoom.players
-            .filter((p) => p.isAlive)
-            .map((p) => {
-              const isSelected = selectedVoteTarget === p.id;
-              const hasVoted = Boolean(currentRoom.votes[p.id]);
+        {/* Clues Review Summary */}
+        <div className="p-4 rounded-2xl bg-pink-950/40 border border-pink-500/20 space-y-2">
+          <div className="text-[10px] font-black text-pink-400 uppercase tracking-wider">
+            Clues Submitted This Round:
+          </div>
+          <div className="grid grid-cols-2 gap-2">
+            {currentRoom.clues.map((c) => (
+              <div
+                key={c.id}
+                className="px-3 py-2 rounded-xl bg-pink-900/30 border border-pink-500/15 flex items-center justify-between text-xs"
+              >
+                <span className="font-bold text-pink-200">{c.playerName}:</span>
+                <span className="font-black text-white">"{c.text}"</span>
+              </div>
+            ))}
+          </div>
+        </div>
 
-              return (
-                <button
-                  key={p.id}
-                  onClick={() => {
-                    sound.playClick();
-                    setSelectedVoteTarget(p.id);
-                  }}
-                  className={`p-4 rounded-2xl text-left border cursor-pointer transition relative ${
-                    isSelected
-                      ? "bg-pink-600/30 border-pink-400 shadow-lg shadow-pink-500/20 ring-2 ring-pink-500"
-                      : "bg-pink-950/30 border-pink-500/20 hover:bg-pink-900/20"
-                  }`}
-                >
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-2.5">
-                      <span className="text-2xl">{p.avatar}</span>
-                      <div>
-                        <div className="font-bold text-sm text-white">
-                          {p.name} {p.id === playerId && "(You)"}
-                        </div>
-                        <div className="text-[10px] text-pink-300/70">
-                          {hasVoted ? "✓ Vote Locked" : "Thinking..."}
+        {/* Player Voting Grid */}
+        <div className="space-y-2">
+          <div className="text-xs font-black text-pink-300 uppercase px-1 flex justify-between">
+            <span>Select a Suspect to Eject</span>
+            <span className="text-pink-400">
+              Votes Cast: {Object.keys(currentRoom.votes).length}/{currentRoom.players.length}
+            </span>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+            {currentRoom.players
+              .filter((p) => p.isAlive)
+              .map((p) => {
+                const isSelected = selectedVoteTarget === p.id;
+                const hasVoted = Boolean(currentRoom.votes[p.id]);
+
+                return (
+                  <button
+                    key={p.id}
+                    disabled={Boolean(myVote)}
+                    onClick={() => {
+                      sound.playClick();
+                      setSelectedVoteTarget(p.id);
+                    }}
+                    className={`p-3.5 rounded-2xl text-left border transition relative cursor-pointer ${
+                      isSelected
+                        ? "bg-gradient-to-br from-pink-600/40 to-pink-950 border-pink-400 ring-2 ring-pink-500 shadow-lg shadow-pink-500/30"
+                        : "bg-pink-950/30 border-pink-500/20 hover:bg-pink-900/30"
+                    } ${myVote ? "opacity-75 cursor-default" : ""}`}
+                  >
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-3">
+                        <span className="text-3xl">{p.avatar}</span>
+                        <div>
+                          <div className="font-black text-sm text-white">
+                            {p.name} {p.id === playerId && "(You)"}
+                          </div>
+                          <div className="text-[10px] text-pink-300/70 font-semibold mt-0.5">
+                            {hasVoted ? "✓ Vote Locked" : "Thinking..."}
+                          </div>
                         </div>
                       </div>
+                      {isSelected && (
+                        <span className="w-5 h-5 rounded-full bg-pink-500 text-white flex items-center justify-center text-xs font-black">
+                          ✓
+                        </span>
+                      )}
                     </div>
-                  </div>
-                </button>
-              );
-            })}
+                  </button>
+                );
+              })}
+          </div>
         </div>
 
+        {/* Skip Option */}
         <button
+          disabled={Boolean(myVote)}
           onClick={() => setSelectedVoteTarget("skip")}
-          className={`w-full py-3 rounded-2xl border text-xs font-bold transition cursor-pointer ${
+          className={`w-full py-3 rounded-2xl border text-xs font-black uppercase transition cursor-pointer ${
             selectedVoteTarget === "skip"
               ? "bg-zinc-800 border-pink-400 text-white ring-2 ring-pink-500"
               : "bg-pink-950/20 border-pink-500/20 text-pink-300 hover:bg-pink-900/20"
-          }`}
+          } ${myVote ? "opacity-75 cursor-default" : ""}`}
         >
           Skip Vote (Not enough evidence)
         </button>
 
-        <button
-          disabled={!selectedVoteTarget}
-          onClick={handleConfirmVote}
-          className={`w-full py-4 rounded-2xl font-black text-sm tracking-wider uppercase transition cursor-pointer shadow-lg ${
-            selectedVoteTarget
-              ? "bg-gradient-to-r from-pink-500 to-pink-600 text-white shadow-pink-500/30 active:scale-95"
-              : "bg-pink-950/40 text-pink-500/40 border border-pink-500/10 cursor-not-allowed"
-          }`}
-        >
-          CONFIRM VOTE
-        </button>
+        {/* Confirm Vote Button */}
+        {!myVote ? (
+          <button
+            disabled={!selectedVoteTarget}
+            onClick={handleConfirmVote}
+            className={`w-full py-4 rounded-2xl font-black text-sm tracking-wider uppercase transition cursor-pointer shadow-lg ${
+              selectedVoteTarget
+                ? "bg-gradient-to-r from-pink-500 via-pink-600 to-pink-500 text-white shadow-pink-500/35 hover:brightness-110 active:scale-95"
+                : "bg-pink-950/40 text-pink-500/40 border border-pink-500/10 cursor-not-allowed"
+            }`}
+          >
+            CONFIRM VOTE
+          </button>
+        ) : (
+          <div className="p-4 rounded-2xl bg-emerald-950/30 border border-emerald-500/30 text-emerald-300 text-xs font-bold text-center animate-pulse">
+            ✓ Your vote is locked in! Waiting for other players to finish voting...
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  // -------------------------------------------------------------
+  // RENDER: EJECTION REVEAL
+  // -------------------------------------------------------------
+  const renderEjectionReveal = () => {
+    if (!currentRoom || !currentRoom.ejectionResult) return null;
+    const res = currentRoom.ejectionResult;
+
+    return (
+      <div className="max-w-md mx-auto py-12 text-center space-y-6 animate-popIn">
+        <div className="text-7xl animate-bounce">
+          {res.isSkip ? "⏩" : res.wasImpostor ? "🎉" : "💀"}
+        </div>
+
+        <div className="space-y-2">
+          <div className="text-xs font-black tracking-widest uppercase text-pink-300">
+            VOTING RESULTS
+          </div>
+
+          {res.isSkip ? (
+            <h2 className="text-3xl font-black text-white">The Vote Was Skipped!</h2>
+          ) : (
+            <div className="space-y-2">
+              <h2 className="text-3xl font-black text-white">
+                {res.electedPlayerAvatar} {res.electedPlayerName} Was Ejected!
+              </h2>
+              <div
+                className={`inline-block px-5 py-2 rounded-2xl text-sm font-black tracking-wider uppercase shadow-xl ${
+                  res.wasImpostor
+                    ? "bg-gradient-to-r from-emerald-500 to-teal-600 text-white ring-2 ring-emerald-300"
+                    : "bg-gradient-to-r from-rose-600 to-pink-700 text-white ring-2 ring-rose-400"
+                }`}
+              >
+                {res.wasImpostor
+                  ? "🎭 THEY WERE THE IMPOSTOR!"
+                  : "🛡️ THEY WERE AN INNOCENT CREWMATE!"}
+              </div>
+            </div>
+          )}
+
+          <p className="text-xs text-pink-200/70 pt-2">
+            {res.wasImpostor
+              ? "The Impostor has one final chance to steal victory by guessing the secret word!"
+              : "The Impostor is still at large and gets to make their deduction!"}
+          </p>
+        </div>
       </div>
     );
   };
@@ -1099,7 +1173,8 @@ export default function Home() {
         {currentRoom && currentRoom.matchPhase === "waiting" && renderWaitingLobby()}
         {currentRoom && currentRoom.matchPhase === "role_reveal" && renderRoleReveal()}
         {currentRoom && currentRoom.matchPhase === "clue_feed" && renderClueFeed()}
-        {currentRoom && currentRoom.matchPhase === "emergency" && renderEmergencyMeeting()}
+        {currentRoom && currentRoom.matchPhase === "voting" && renderVotingPhase()}
+        {currentRoom && currentRoom.matchPhase === "ejection_reveal" && renderEjectionReveal()}
         {currentRoom && currentRoom.matchPhase === "guess" && renderGuessPhase()}
         {currentRoom && currentRoom.matchPhase === "reveal" && renderReveal()}
       </main>

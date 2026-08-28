@@ -15,6 +15,15 @@ export type RoomPlayer = {
   suspicion?: number;
 };
 
+export type EjectionResult = {
+  electedTargetId: string;
+  electedPlayerName: string | null;
+  electedPlayerAvatar: string | null;
+  wasImpostor: boolean;
+  isSkip: boolean;
+  voteTally: Record<string, number>;
+};
+
 export type GameRoom = {
   id: string; // e.g. "PINK-8472"
   name: string;
@@ -30,10 +39,10 @@ export type GameRoom = {
   clues: Clue[];
   currentTurnPlayerId: string | null;
   turnIndex: number;
-  matchPhase: "waiting" | "role_reveal" | "clue_feed" | "emergency" | "guess" | "reveal";
+  matchPhase: "waiting" | "role_reveal" | "clue_feed" | "voting" | "ejection_reveal" | "emergency" | "guess" | "reveal";
   emergencyCaller?: string | null;
   votes: Record<string, string>; // voterId -> targetPlayerId | "skip"
-  eliminatedPlayer?: RoomPlayer | null;
+  ejectionResult?: EjectionResult | null;
   winner: "impostor" | "crewmates" | null;
   impostorGuess: string | null;
   isGuessCorrect: boolean | null;
@@ -198,6 +207,7 @@ class MultiplayerSyncManager {
       turnIndex: 0,
       matchPhase: "waiting",
       votes: {},
+      ejectionResult: null,
       winner: null,
       impostorGuess: null,
       isGuessCorrect: null,
@@ -313,6 +323,7 @@ class MultiplayerSyncManager {
     room.turnIndex = 0;
     room.currentTurnPlayerId = updatedPlayers[0].id;
     room.votes = {};
+    room.ejectionResult = null;
     room.winner = null;
     room.impostorGuess = null;
     room.isGuessCorrect = null;
@@ -362,9 +373,13 @@ class MultiplayerSyncManager {
     const nextTurnIndex = room.turnIndex + 1;
     room.turnIndex = nextTurnIndex;
 
-    const clueLimit = Math.max(room.players.length * 2, 4);
-    if (room.clues.length >= clueLimit) {
-      room.matchPhase = "guess";
+    // Check if every player has submitted a clue (or clue round complete)
+    const requiredClues = room.players.length;
+    if (room.clues.length >= requiredClues) {
+      // Transition immediately to the VOTING PHASE!
+      room.matchPhase = "voting";
+      room.votes = {};
+      room.currentTurnPlayerId = null;
     } else {
       const alivePlayers = room.players.filter((p) => p.isAlive);
       const nextPlayer = alivePlayers[nextTurnIndex % alivePlayers.length];
@@ -378,35 +393,18 @@ class MultiplayerSyncManager {
     return room;
   }
 
-  public triggerEmergencyMeeting(roomId: string, callerPlayerId: string): GameRoom | null {
-    const rooms = this.getAllRoomsFromStorage();
-    const room = rooms.find((r) => r.id === roomId);
-    if (!room) return null;
-
-    const caller = room.players.find((p) => p.id === callerPlayerId);
-    room.matchPhase = "emergency";
-    room.emergencyCaller = caller ? caller.name : "Player";
-    room.votes = {};
-    room.eliminatedPlayer = null;
-    room.updatedAt = Date.now();
-
-    this.saveRoomToStorage(room);
-    this.broadcast({ type: "ROOM_UPDATED", room });
-    this.notifyRoomListeners(room.id, room);
-    return room;
-  }
-
   public castVote(roomId: string, voterId: string, targetId: string): GameRoom | null {
     const rooms = this.getAllRoomsFromStorage();
     const room = rooms.find((r) => r.id === roomId);
-    if (!room || room.matchPhase !== "emergency") return null;
+    if (!room || (room.matchPhase !== "voting" && room.matchPhase !== "emergency")) return null;
 
     room.votes[voterId] = targetId;
 
     const alivePlayers = room.players.filter((p) => p.isAlive);
-    const allVoted = alivePlayers.every((p) => room.votes[p.id]);
+    const allVoted = alivePlayers.every((p) => Boolean(room.votes[p.id]));
 
     if (allVoted) {
+      // Calculate Vote Tally
       const tally: Record<string, number> = {};
       Object.values(room.votes).forEach((target) => {
         tally[target] = (tally[target] || 0) + 1;
@@ -421,32 +419,33 @@ class MultiplayerSyncManager {
         }
       });
 
-      if (electedTarget !== "skip") {
-        const eliminated = room.players.find((p) => p.id === electedTarget);
-        if (eliminated) {
-          eliminated.isAlive = false;
-          room.eliminatedPlayer = eliminated;
+      const electedPlayer = room.players.find((p) => p.id === electedTarget) || null;
+      const isSkip = electedTarget === "skip";
+      const wasImpostor = electedPlayer ? electedPlayer.id === room.impostorId : false;
 
-          if (eliminated.id === room.impostorId) {
-            room.winner = "crewmates";
-            room.matchPhase = "reveal";
-          }
+      room.ejectionResult = {
+        electedTargetId: electedTarget,
+        electedPlayerName: electedPlayer ? electedPlayer.name : "Skip",
+        electedPlayerAvatar: electedPlayer ? electedPlayer.avatar : "⏩",
+        wasImpostor,
+        isSkip,
+        voteTally: tally,
+      };
+
+      room.matchPhase = "ejection_reveal";
+
+      // Schedule transition to Guess Phase after Ejection Reveal
+      setTimeout(() => {
+        const currentRooms = this.getAllRoomsFromStorage();
+        const cur = currentRooms.find((r) => r.id === roomId);
+        if (cur && cur.matchPhase === "ejection_reveal") {
+          cur.matchPhase = "guess";
+          cur.updatedAt = Date.now();
+          this.saveRoomToStorage(cur);
+          this.broadcast({ type: "ROOM_UPDATED", room: cur });
+          this.notifyRoomListeners(cur.id, cur);
         }
-      }
-
-      if (room.winner === null) {
-        setTimeout(() => {
-          const currentRooms = this.getAllRoomsFromStorage();
-          const cur = currentRooms.find((r) => r.id === roomId);
-          if (cur && cur.matchPhase === "emergency") {
-            cur.matchPhase = "clue_feed";
-            cur.updatedAt = Date.now();
-            this.saveRoomToStorage(cur);
-            this.broadcast({ type: "ROOM_UPDATED", room: cur });
-            this.notifyRoomListeners(cur.id, cur);
-          }
-        }, 3500);
-      }
+      }, 4500);
     }
 
     room.updatedAt = Date.now();
@@ -466,7 +465,16 @@ class MultiplayerSyncManager {
 
     room.impostorGuess = guessText.trim();
     room.isGuessCorrect = isCorrect;
-    room.winner = isCorrect ? "impostor" : "crewmates";
+
+    // Check if Impostor was already caught in voting:
+    // If Impostor was voted out, they only win if they guessed the secret word correctly!
+    // If Crewmates voted out the Impostor and Impostor guessed wrong -> Crewmates Win!
+    if (isCorrect) {
+      room.winner = "impostor";
+    } else {
+      room.winner = "crewmates";
+    }
+
     room.matchPhase = "reveal";
     room.status = "finished";
     room.updatedAt = Date.now();
@@ -499,6 +507,7 @@ class MultiplayerSyncManager {
     room.impostorId = null;
     room.clues = [];
     room.votes = {};
+    room.ejectionResult = null;
     room.winner = null;
     room.impostorGuess = null;
     room.isGuessCorrect = null;
