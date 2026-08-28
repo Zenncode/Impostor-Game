@@ -8,7 +8,7 @@ import sound from "./lib/soundSystem";
 import { loadStats, recordGameResult, PlayerStats } from "./lib/stats";
 import { DIFFICULTY_CONFIG } from "./constants/gameConfig";
 import type { Difficulty } from "./constants/words";
-import { validateClue, formatTime } from "./lib/gameHelpers";
+import { validateClue, generateUniquePinkProfile } from "./lib/gameHelpers";
 import {
   multiplayerSync,
   GameRoom,
@@ -23,9 +23,9 @@ export default function Home() {
   const [isStatsOpen, setIsStatsOpen] = useState(false);
   const [stats, setStats] = useState<PlayerStats | null>(null);
 
-  // Local Player Identity
+  // Local Player Identity (Always unique per browser/device)
   const [playerId, setPlayerId] = useState("");
-  const [playerName, setPlayerName] = useState("Player_Pink");
+  const [playerName, setPlayerName] = useState("");
   const [playerAvatar, setPlayerAvatar] = useState("🌸");
 
   // Create Lobby Form State
@@ -53,20 +53,31 @@ export default function Home() {
 
   const timerRef = useRef<NodeJS.Timeout | null>(null);
 
-  // Initialize Player ID & Profile
+  // Initialize Unique Player ID & Profile per Browser
   useEffect(() => {
     setStats(loadStats());
+
     let savedId = localStorage.getItem("impostor_player_id");
     if (!savedId) {
-      savedId = "player_" + Math.floor(1000 + Math.random() * 9000);
+      savedId = "player_" + Math.random().toString(36).substring(2, 9);
       localStorage.setItem("impostor_player_id", savedId);
     }
     setPlayerId(savedId);
 
-    const savedName = localStorage.getItem("impostor_player_name");
-    const savedAvatar = localStorage.getItem("impostor_player_avatar");
-    if (savedName) setPlayerName(savedName);
-    if (savedAvatar) setPlayerAvatar(savedAvatar);
+    let savedName = localStorage.getItem("impostor_player_name");
+    let savedAvatar = localStorage.getItem("impostor_player_avatar");
+
+    // If no name or generic old name, generate a unique cute pink profile!
+    if (!savedName || savedName === "Player_Pink" || savedName === "Guest_Pink") {
+      const generated = generateUniquePinkProfile();
+      savedName = generated.name;
+      savedAvatar = savedAvatar || generated.avatar;
+      localStorage.setItem("impostor_player_name", savedName);
+      localStorage.setItem("impostor_player_avatar", savedAvatar);
+    }
+
+    setPlayerName(savedName);
+    setPlayerAvatar(savedAvatar || "🌸");
   }, []);
 
   const handleUpdateProfile = (name: string, avatar: string) => {
@@ -74,6 +85,12 @@ export default function Home() {
     setPlayerAvatar(avatar);
     localStorage.setItem("impostor_player_name", name);
     localStorage.setItem("impostor_player_avatar", avatar);
+  };
+
+  const handleRollRandomProfile = () => {
+    sound.playClick();
+    const generated = generateUniquePinkProfile();
+    handleUpdateProfile(generated.name, generated.avatar);
   };
 
   // Subscribe to Active Online Rooms
@@ -119,9 +136,9 @@ export default function Home() {
   const handleCreateLobby = () => {
     sound.playClick();
     const newRoom = multiplayerSync.createRoom(
-      { id: playerId, name: playerName, avatar: playerAvatar },
+      { id: playerId, name: playerName || "PinkPlayer", avatar: playerAvatar },
       {
-        name: createRoomName || playerName + "'s Room",
+        name: createRoomName || (playerName || "Pink") + "'s Room",
         maxPlayers: createMaxPlayers,
         difficulty: createDifficulty,
         gameMode: createGameMode,
@@ -136,7 +153,7 @@ export default function Home() {
     setJoinError(null);
     const res = multiplayerSync.joinRoom(roomId, {
       id: playerId,
-      name: playerName,
+      name: playerName || "PinkPlayer",
       avatar: playerAvatar,
     });
     if (res.success && res.room) {
@@ -316,26 +333,35 @@ export default function Home() {
         </p>
       </div>
 
-      {/* Profile Bar */}
+      {/* Profile Bar with Unique Name & Randomizer */}
       <div className="p-4 rounded-3xl bg-pink-950/40 border border-pink-500/25 flex flex-col sm:flex-row items-center justify-between gap-4 shadow-lg">
         <div className="flex items-center gap-3 w-full sm:w-auto">
-          <div className="text-3xl p-2 rounded-2xl bg-pink-500/20 border border-pink-500/30">
+          <div className="text-3xl p-2.5 rounded-2xl bg-pink-500/20 border border-pink-500/30 shadow-inner">
             {playerAvatar}
           </div>
           <div className="flex-1">
             <div className="text-[10px] uppercase font-black tracking-wider text-pink-400">
-              Your Online Identity
+              Your Player Identity
             </div>
-            <input
-              value={playerName}
-              onChange={(e) => handleUpdateProfile(e.target.value, playerAvatar)}
-              placeholder="Enter your name..."
-              className="font-black text-white text-base bg-transparent outline-none border-b border-pink-500/30 focus:border-pink-400 px-1 py-0.5 w-full max-w-[200px]"
-            />
+            <div className="flex items-center gap-2 mt-0.5">
+              <input
+                value={playerName}
+                onChange={(e) => handleUpdateProfile(e.target.value, playerAvatar)}
+                placeholder="Enter your name..."
+                className="font-black text-white text-base bg-transparent outline-none border-b border-pink-500/30 focus:border-pink-400 px-1 py-0.5 w-full max-w-[180px]"
+              />
+              <button
+                onClick={handleRollRandomProfile}
+                title="Roll a new cute random name & avatar"
+                className="px-2.5 py-1 rounded-xl bg-pink-500/20 hover:bg-pink-500/30 border border-pink-500/30 text-pink-200 text-xs font-black cursor-pointer transition active:scale-95 flex items-center gap-1 shadow-sm"
+              >
+                <span>🎲</span> Random
+              </button>
+            </div>
           </div>
         </div>
-        <div className="flex gap-1.5">
-          {["🌸", "🎀", "💗", "🦩", "💖", "🎭", "✨", "👑"].map((emoji) => (
+        <div className="flex gap-1.5 flex-wrap justify-center">
+          {["🌸", "🎀", "💗", "🦩", "💖", "🎭", "✨", "👑", "🦄", "🍧", "🧁", "🌷"].map((emoji) => (
             <button
               key={emoji}
               onClick={() => {

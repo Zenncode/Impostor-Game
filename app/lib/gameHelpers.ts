@@ -4,8 +4,33 @@ import { DIFFICULTY_CONFIG } from "../constants/gameConfig";
 import { WORD_CATEGORY_MAP, getWordsForDifficulty } from "../constants/words";
 import type { Difficulty } from "../constants/words";
 
+const PINK_ADJECTIVES = [
+  "Sakura", "Rose", "Berry", "Blush", "Pink", "Mochi", "Peach", "Candy",
+  "Lotus", "Flamingo", "Velvet", "Ruby", "Petal", "Glitter", "Sparkle", "Sweet", "Cherry"
+];
+
+const PINK_NOUNS = [
+  "Bunny", "Fox", "Kitty", "Queen", "Angel", "Fairy", "Panda", "Puppy",
+  "Princess", "Star", "Detective", "Sprite", "Butterfly", "Diva", "Ninja"
+];
+
+const PINK_AVATARS = [
+  "🌸", "🎀", "💗", "🦩", "🌺", "💖", "✨", "🎭", "🌷", "👑", "🦄", "🍧", "🧁", "🍥"
+];
+
+export function generateUniquePinkProfile(): { name: string; avatar: string } {
+  const adj = PINK_ADJECTIVES[Math.floor(Math.random() * PINK_ADJECTIVES.length)];
+  const noun = PINK_NOUNS[Math.floor(Math.random() * PINK_NOUNS.length)];
+  const num = Math.floor(10 + Math.random() * 90);
+  const avatar = PINK_AVATARS[Math.floor(Math.random() * PINK_AVATARS.length)];
+  return {
+    name: adj + noun + "_" + num,
+    avatar,
+  };
+}
+
 export function generateGuestName(): string {
-  return `Guest_${Math.floor(1000 + Math.random() * 9000)}`;
+  return generateUniquePinkProfile().name;
 }
 
 export function generatePlayers(count: number, guestName: string): Player[] {
@@ -25,8 +50,8 @@ export function generatePlayers(count: number, guestName: string): Player[] {
   });
   for(let i=1; i<count; i++){
     players.push({
-      id: `bot-${i}`,
-      name: botNames[(i-1) % botNames.length] + `_${i}`,
+      id: "bot-" + i,
+      name: botNames[(i-1) % botNames.length] + "_" + i,
       isHuman: false,
       role: null,
       isAlive: true,
@@ -58,87 +83,36 @@ export function pickSecretWord(diff: Difficulty, previousWord?: string): WordEnt
   const pool: WordEntry[] = getWordsForDifficulty(diff);
   let filtered = pool;
   if(previousWord){
-    filtered = pool.filter(w=>w.word.toLowerCase() !== previousWord.toLowerCase());
+    filtered = pool.filter(w => w.word !== previousWord);
   }
+  if(filtered.length === 0) filtered = pool;
   return filtered[Math.floor(Math.random()*filtered.length)];
 }
 
-export function validateClue(clue: string, secretWord: string): ClueValidationResult {
-  const trimmed = clue.trim();
-  if(!trimmed) return { valid: false, reason: "Clue cannot be empty" };
-  if(trimmed.includes(" ")) return { valid: false, reason: "Only ONE WORD allowed" };
-  if(trimmed.length < 2) return { valid: false, reason: "Clue too short (min 2 letters)" };
-  if(trimmed.length > 20) return { valid: false, reason: "Clue too long (max 20 letters)" };
-  if(!/^[a-zA-Z\u00C0-\u024F\-]+$/.test(trimmed)) return { valid: false, reason: "Only letters and hyphen allowed" };
-  const lowerClue = trimmed.toLowerCase();
-  const lowerSecret = secretWord.toLowerCase();
-  if(lowerClue === lowerSecret) return { valid: false, reason: "Cannot use the secret word itself!" };
-  if(lowerSecret.includes(lowerClue) && lowerClue.length >= 3) return { valid: false, reason: "Cannot use part of the secret word" };
-  if(lowerClue.includes(lowerSecret) && lowerSecret.length >= 3) return { valid: false, reason: "Cannot contain the secret word" };
-  // rhyming heuristic: same last 3 letters and length similar
-  if(lowerClue.length >= 3 && lowerSecret.length >=3){
-    const clueEnd = lowerClue.slice(-3);
-    const secretEnd = lowerSecret.slice(-3);
-    if(clueEnd === secretEnd && lowerClue !== lowerSecret) {
-      // only block if not already caught; give warning but allow? spec says cannot use rhyming. We'll block if 4+ letters.
-      if(lowerClue.length >3) return { valid: false, reason: "Rhyming words are not allowed" };
-    }
+export function validateClue(rawClue: string, secretWord: string): ClueValidationResult {
+  const clue = rawClue.trim().toLowerCase();
+  const target = secretWord.trim().toLowerCase();
+
+  if(!clue) return { valid: false, reason: "Clue cannot be empty" };
+  if(clue.includes(" ")) return { valid: false, reason: "Clue must be ONE word only" };
+  if(!/^[a-z\u00C0-\u024F\-]+$/i.test(clue)) return { valid: false, reason: "Clue must contain only letters" };
+
+  if(clue === target) return { valid: false, reason: "Cannot use the secret word" };
+  if(clue.includes(target) && target.length > 2) return { valid: false, reason: "Cannot contain the secret word" };
+  if(target.includes(clue) && clue.length > 2) return { valid: false, reason: "Cannot be a substring of the secret word" };
+
+  // check rhyming: ending 3 letters match
+  if(target.length >= 4 && clue.length >= 4){
+    const targetEnd = target.slice(-3);
+    const clueEnd = clue.slice(-3);
+    if(targetEnd === clueEnd) return { valid: false, reason: "Rhyming clues are not allowed" };
   }
+
   return { valid: true };
 }
 
-export function buildHints(wordEntry: WordEntry, diff: Difficulty){
-  const cfg = DIFFICULTY_CONFIG[diff];
-  const hints: {type: "first_letter"|"category"|"length", value:string, used:boolean}[] = [];
-  if(cfg.hints >=1){
-    hints.push({ type: "category", value: `Category: ${wordEntry.category}`, used: false });
-  }
-  if(cfg.hints >=2){
-    hints.unshift({ type: "first_letter", value: `First letter: "${wordEntry.word[0].toUpperCase()}"`, used: false });
-  }
-  if(cfg.hints >=3){
-    hints.push({ type: "length", value: `Length: ${wordEntry.word.length} letters`, used: false });
-  }
-  // Order: first_letter, category, length for easy
-  if(diff === "easy"){
-    // ensure order first, category, length
-    hints.sort((a,b)=>{
-      const order: Record<string,number> = { first_letter:0, category:1, length:2 };
-      return order[a.type]-order[b.type];
-    });
-  }
-  return hints;
-}
-
-export function calcSuspicionDelta(clue: string, secretWord: WordEntry, isImpostor: boolean, previousClues: string[]): number {
-  if(isImpostor){
-    // impostor clue vagueness check
-    const vague = ["thing","stuff","nice","cool","interesting","useful","common","special","great","important"];
-    if(vague.includes(clue.toLowerCase())) return 25;
-    if(previousClues.includes(clue.toLowerCase())) return 30;
-    return 15;
-  } else {
-    // crewmate suspicion low if clue is related
-    // check if clue is in clue bank for that word -> reduce suspicion
-    return -5;
-  }
-}
-
-export function shuffleArray<T>(arr: T[]): T[] {
-  const copy = [...arr];
-  for(let i=copy.length-1; i>0; i--){
-    const j = Math.floor(Math.random()*(i+1));
-    [copy[i], copy[j]] = [copy[j], copy[i]];
-  }
-  return copy;
-}
-
-export function getCategoryForWord(word: string): string {
-  return WORD_CATEGORY_MAP[word.toLowerCase()] || "Unknown";
-}
-
 export function formatTime(seconds: number): string {
-  const m = Math.floor(seconds/60);
+  const m = Math.floor(seconds / 60);
   const s = seconds % 60;
-  return `${m}:${s.toString().padStart(2,"0")}`;
+  return m + ":" + (s < 10 ? "0" : "") + s;
 }
