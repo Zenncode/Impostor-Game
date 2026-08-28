@@ -1,0 +1,22 @@
+{
+  "name": "Impostor Word Guesser — Pink Edition",
+  "short_name": "Impostor Pink",
+  "description": "Social deduction word guessing game: find the secret word, trust no one!",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#1A0A0F",
+  "theme_color": "#FF1493",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    },
+    {
+      "src": "/icon.svg",
+      "sizes": "192x192 512x512",
+      "type": "image/svg+xml"
+    }
+  ]
+}
+

@@ -70,7 +70,7 @@ export const PINK_PALETTE = {
 } as const;
 
 export const GAME_LIMITS = {
-  minPlayers: 4,
+  minPlayers: 3,
   maxPlayers: 10,
   minClueLength: 2,
   maxClueLength: 20,
